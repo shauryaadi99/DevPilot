@@ -20,3 +20,4 @@ def test_database_session_execution():
         assert result == 1
     finally:
         db.close()
+

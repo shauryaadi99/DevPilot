@@ -49,3 +49,4 @@ def check_database_connection() -> Dict[str, Any]:
             "engine": "unknown",
             "error": str(e),
         }
+

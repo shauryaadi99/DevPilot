@@ -30,7 +30,8 @@ class GroqProvider:
         timeout: Optional[float] = None,
     ):
         settings = get_settings()
-        self.api_key = api_key or settings.GROQ_API_KEY
+        self._explicit_key = api_key is not None
+        self.api_key = api_key if self._explicit_key else settings.GROQ_API_KEY
         self.model = model or settings.GROQ_MODEL
         self.timeout = timeout or settings.GROQ_TIMEOUT_SECONDS
         self._client: Optional[Any] = None
@@ -38,6 +39,14 @@ class GroqProvider:
     @property
     def is_configured(self) -> bool:
         """Check whether valid credentials are provided."""
+        if not self._explicit_key and (not self.api_key or self.api_key.strip() == "" or self.api_key == "your_groq_api_key_here"):
+            fresh_settings = get_settings(reload=True)
+            if fresh_settings.GROQ_API_KEY and fresh_settings.GROQ_API_KEY.strip() and fresh_settings.GROQ_API_KEY != "your_groq_api_key_here":
+                self.api_key = fresh_settings.GROQ_API_KEY
+                self.model = fresh_settings.GROQ_MODEL
+                self.timeout = fresh_settings.GROQ_TIMEOUT_SECONDS
+                self._client = None
+
         return bool(self.api_key and self.api_key.strip() and self.api_key != "your_groq_api_key_here")
 
     def _get_client(self) -> Any:
@@ -144,3 +153,4 @@ def get_groq_provider() -> GroqProvider:
     if _groq_provider_instance is None:
         _groq_provider_instance = GroqProvider()
     return _groq_provider_instance
+

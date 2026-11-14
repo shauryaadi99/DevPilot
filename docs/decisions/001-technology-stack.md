@@ -29,3 +29,4 @@ We adopt the following stack:
 ## 4. Consequences
 - **Positive:** Fast development velocity, instant local start, zero cloud cost for Chapter 1.
 - **Mitigations:** The Groq integration is strictly isolated in `backend/app/integrations/` to ensure provider portability. Database queries use standard SQLAlchemy constructs to maintain engine agnosticism.
+

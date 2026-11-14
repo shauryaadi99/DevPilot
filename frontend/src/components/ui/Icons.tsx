@@ -143,3 +143,4 @@ export const Clock: React.FC<IconProps> = ({ size = 20, className = "", ...props
     <polyline points="12 6 12 12 16 14" />
   </svg>
 );
+

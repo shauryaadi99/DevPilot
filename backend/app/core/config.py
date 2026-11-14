@@ -1,8 +1,7 @@
 """Application configuration management using Pydantic Settings."""
 
 import json
-from functools import lru_cache
-from typing import List, Union
+from typing import List, Optional, Union
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -41,7 +40,7 @@ class Settings(BaseSettings):
 
     # Groq LLM settings
     GROQ_API_KEY: str | None = None
-    GROQ_MODEL: str = "llama-3.3-70b-versatile"
+    GROQ_MODEL: str = "qwen/qwen3.8-27b"
     GROQ_TIMEOUT_SECONDS: float = 30.0
 
     model_config = SettingsConfigDict(
@@ -51,7 +50,12 @@ class Settings(BaseSettings):
     )
 
 
-@lru_cache
-def get_settings() -> Settings:
-    """Return cached Settings instance."""
-    return Settings()
+_settings_cache: Optional[Settings] = None
+
+
+def get_settings(reload: bool = False) -> Settings:
+    """Return Settings instance, reloading from environment if reload=True."""
+    global _settings_cache
+    if reload or _settings_cache is None:
+        _settings_cache = Settings()
+    return _settings_cache

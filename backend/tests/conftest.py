@@ -10,3 +10,4 @@ def client():
     """Create a FastAPI test client instance."""
     with TestClient(app) as test_client:
         yield test_client
+

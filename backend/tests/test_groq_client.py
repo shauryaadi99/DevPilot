@@ -72,3 +72,4 @@ def test_groq_timeout_handling():
         assert result["status"] == "timeout"
         assert result["configured"] is True
         assert "5.0" in result["message"]
+

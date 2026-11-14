@@ -30,3 +30,4 @@ def test_api_v1_health_endpoint(client):
     assert components["llm"]["provider"] == "groq"
     assert "configured" in components["llm"]
     assert "model" in components["llm"]
+
