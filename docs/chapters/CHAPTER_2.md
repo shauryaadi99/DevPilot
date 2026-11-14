@@ -2,7 +2,7 @@
 
 **Project:** DevPilot  
 **Chapter:** 2 of 5  
-**Status:** NOT STARTED  
+**Status:** COMPLETED  
 **Depends on:** Chapter 1
 
 ---
@@ -238,19 +238,19 @@ These belong to later chapters.
 
 ## 8. ACCEPTANCE CRITERIA
 
-- [ ] User can authorize GitHub access.
-- [ ] Authorized repositories can be listed.
-- [ ] User can select a repository.
-- [ ] Repository metadata can be retrieved.
-- [ ] Repository inspection works on supported repository types.
-- [ ] Unsupported or incomplete repository information is reported honestly.
-- [ ] Product Analyst generates structured requirements.
-- [ ] Architect produces a repository-aware plan.
-- [ ] Plans distinguish facts from assumptions.
-- [ ] User can approve, reject or request changes.
-- [ ] Approval decisions persist.
-- [ ] No source code is modified by DevPilot.
-- [ ] Tests cover the repository inspection and planning workflow.
+- [x] User can authorize GitHub access.
+- [x] Authorized repositories can be listed.
+- [x] User can select a repository.
+- [x] Repository metadata can be retrieved.
+- [x] Repository inspection works on supported repository types.
+- [x] Unsupported or incomplete repository information is reported honestly.
+- [x] Product Analyst generates structured requirements.
+- [x] Architect produces a repository-aware plan.
+- [x] Plans distinguish facts from assumptions.
+- [x] User can approve, reject or request changes.
+- [x] Approval decisions persist.
+- [x] No source code is modified by DevPilot.
+- [x] Tests cover the repository inspection and planning workflow.
 
 ## 9. REQUIRED FINAL REPORT
 

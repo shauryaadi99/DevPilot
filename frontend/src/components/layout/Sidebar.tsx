@@ -7,27 +7,41 @@ import {
   Send,
   Sliders,
   FileCode,
+  Check,
 } from "@/components/ui/Icons";
 
-export const Sidebar: React.FC = () => {
+interface SidebarProps {
+  activeTab?: "diagnostics" | "planning";
+  onTabChange?: (tab: "diagnostics" | "planning") => void;
+}
+
+export const Sidebar: React.FC<SidebarProps> = ({
+  activeTab = "planning",
+  onTabChange,
+}) => {
   const chapters = [
     {
       num: 1,
       title: "Foundation & Setup",
-      active: true,
+      completed: true,
+      active: activeTab === "diagnostics",
       desc: "Architecture, Backend, Frontend, DB & LLM Base",
       icon: Layers,
+      tab: "diagnostics" as const,
     },
     {
       num: 2,
       title: "Repo Intelligence",
-      active: false,
+      completed: false,
+      active: activeTab === "planning",
       desc: "GitHub, Codebase Analysis, Architect Agent",
       icon: GitBranch,
+      tab: "planning" as const,
     },
     {
       num: 3,
       title: "Autonomous Engine",
+      completed: false,
       active: false,
       desc: "Developer Agent, Isolated Sandbox, Git",
       icon: Cpu,
@@ -35,6 +49,7 @@ export const Sidebar: React.FC = () => {
     {
       num: 4,
       title: "QA & Code Review",
+      completed: false,
       active: false,
       desc: "QA Engineer, Tests, Reviewer Agent",
       icon: CheckCircle2,
@@ -42,6 +57,7 @@ export const Sidebar: React.FC = () => {
     {
       num: 5,
       title: "GitHub Delivery",
+      completed: false,
       active: false,
       desc: "Dashboard, PR Creation, End-to-End",
       icon: Send,
@@ -58,19 +74,32 @@ export const Sidebar: React.FC = () => {
           <div className="mt-2 space-y-1">
             {chapters.map((ch) => {
               const Icon = ch.icon;
+              const isClickable = ch.tab !== undefined;
+
               return (
-                <div
+                <button
                   key={ch.num}
-                  className={`p-2.5 rounded-lg border text-left transition-all ${
+                  type="button"
+                  disabled={!isClickable}
+                  onClick={() => ch.tab && onTabChange && onTabChange(ch.tab)}
+                  className={`w-full p-2.5 rounded-lg border text-left transition-all ${
                     ch.active
-                      ? "bg-blue-950/40 border-blue-800/60 text-white shadow-sm"
-                      : "border-transparent text-gray-500 opacity-60 hover:opacity-80"
+                      ? "bg-blue-950/40 border-blue-800/60 text-white shadow-sm ring-1 ring-blue-500/30"
+                      : ch.completed
+                      ? "bg-emerald-950/10 border-gray-800/60 text-gray-300 hover:bg-gray-900/60"
+                      : isClickable
+                      ? "border-transparent text-gray-300 hover:bg-gray-900/60"
+                      : "border-transparent text-gray-600 opacity-60 cursor-not-allowed"
                   }`}
                 >
                   <div className="flex items-center gap-2.5">
                     <Icon
-                      className={`w-4 h-4 ${
-                        ch.active ? "text-blue-400" : "text-gray-500"
+                      className={`w-4 h-4 shrink-0 ${
+                        ch.active
+                          ? "text-blue-400"
+                          : ch.completed
+                          ? "text-emerald-400"
+                          : "text-gray-500"
                       }`}
                     />
                     <div className="flex-1 min-w-0">
@@ -78,18 +107,22 @@ export const Sidebar: React.FC = () => {
                         <span className="text-xs font-medium truncate">
                           Ch. {ch.num}: {ch.title}
                         </span>
-                        {ch.active && (
+                        {ch.active ? (
                           <span className="text-[10px] bg-blue-500/20 text-blue-300 px-1.5 py-0.2 rounded font-mono">
                             ACTIVE
                           </span>
-                        )}
+                        ) : ch.completed ? (
+                          <span className="text-[10px] bg-emerald-500/20 text-emerald-400 px-1.5 py-0.2 rounded font-mono flex items-center gap-1">
+                            <Check className="w-2.5 h-2.5" /> DONE
+                          </span>
+                        ) : null}
                       </div>
                       <p className="text-[11px] text-gray-400 truncate mt-0.5">
                         {ch.desc}
                       </p>
                     </div>
                   </div>
-                </div>
+                </button>
               );
             })}
           </div>
@@ -109,17 +142,17 @@ export const Sidebar: React.FC = () => {
               <FileCode className="w-4 h-4 text-gray-400" />
               <span>Swagger API Docs</span>
             </a>
-            <div className="flex items-center gap-2 px-2.5 py-2 rounded-md text-gray-500 cursor-not-allowed">
-              <Sliders className="w-4 h-4 text-gray-500" />
-              <span>Agent Settings (Ch. 2)</span>
+            <div className="flex items-center gap-2 px-2.5 py-2 rounded-md text-gray-600 cursor-not-allowed">
+              <Sliders className="w-4 h-4 text-gray-600" />
+              <span>Execution Sandbox (Ch. 3)</span>
             </div>
           </div>
         </div>
       </div>
 
       <div className="p-4 border-t border-gray-800 text-[11px] text-gray-500 space-y-1">
-        <p>DevPilot Architecture v0.1.0</p>
-        <p className="text-[10px] text-gray-600">Chapter 1 Foundation Active</p>
+        <p>DevPilot Multi-Agent System</p>
+        <p className="text-[10px] text-blue-400/80">Chapter 2 Active</p>
       </div>
     </aside>
   );

@@ -1,0 +1,306 @@
+"""Tasks API router.
+
+Handles requirement submission, repository inspection, Product Analyst analysis,
+Architect planning, and persistent human approval workflows.
+"""
+
+from typing import Any, Dict, List, Optional
+from fastapi import APIRouter, Depends, HTTPException, Header
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from app.db.session import get_db
+from app.db.models import (
+    Repository,
+    Task,
+    InspectionResult,
+    RequirementAnalysis,
+    ImplementationPlan,
+    PlanApproval,
+)
+from app.integrations.github_client import GitHubClient, GitHubError
+from app.services.inspection_service import InspectionService
+from app.agents.product_analyst import ProductAnalystAgent
+from app.agents.architect import ArchitectAgent
+from app.core.logging import logger
+
+router = APIRouter(prefix="/api/v1/tasks", tags=["Tasks & Planning"])
+
+
+class CreateTaskRequest(BaseModel):
+    repository_id: str
+    title: str
+    requirement: str
+
+
+class ApprovalRequest(BaseModel):
+    decision: str  # APPROVED, REJECTED, CHANGES_REQUESTED
+    feedback: Optional[str] = None
+
+
+@router.post("", summary="Create a New Task")
+def create_task(payload: CreateTaskRequest, db: Session = Depends(get_db)):
+    """Submit a natural-language engineering requirement for a connected repository."""
+    repo = db.query(Repository).filter(Repository.id == payload.repository_id).first()
+    if not repo:
+        raise HTTPException(status_code=404, detail="Target repository not found.")
+
+    task = Task(
+        repository_id=repo.id,
+        title=payload.title.strip(),
+        user_requirement=payload.requirement.strip(),
+        status="PENDING",
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+@router.get("", summary="List All Tasks")
+def list_tasks(limit: int = 20, db: Session = Depends(get_db)):
+    """List recent engineering tasks."""
+    tasks = db.query(Task).order_by(Task.created_at.desc()).limit(limit).all()
+    return tasks
+
+
+@router.get("/{task_id}", summary="Get Full Task Details")
+def get_task(task_id: str, db: Session = Depends(get_db)):
+    """Retrieve full task context including inspection findings, requirements, plan, and approval."""
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+
+    return {
+        "id": task.id,
+        "title": task.title,
+        "requirement": task.user_requirement,
+        "status": task.status,
+        "created_at": task.created_at.isoformat(),
+        "updated_at": task.updated_at.isoformat(),
+        "repository": {
+            "id": task.repository.id,
+            "name": task.repository.name,
+            "full_name": task.repository.full_name,
+            "owner": task.repository.owner,
+            "default_branch": task.repository.default_branch,
+            "html_url": task.repository.html_url,
+        },
+        "inspection": {
+            "tree_summary": task.inspection.tree_summary,
+            "detected_languages": task.inspection.detected_languages,
+            "detected_frameworks": task.inspection.detected_frameworks,
+            "detected_entrypoints": task.inspection.detected_entrypoints,
+            "manifests_summary": task.inspection.manifests_summary,
+            "confirmed_facts": task.inspection.confirmed_facts,
+            "unknowns": task.inspection.unknowns,
+        } if task.inspection else None,
+        "requirement_analysis": {
+            "requirement_summary": task.requirement_analysis.requirement_summary,
+            "functional_requirements": task.requirement_analysis.functional_requirements,
+            "nonfunctional_requirements": task.requirement_analysis.nonfunctional_requirements,
+            "acceptance_criteria": task.requirement_analysis.acceptance_criteria,
+            "ambiguities": task.requirement_analysis.ambiguities,
+            "clarification_questions": task.requirement_analysis.clarification_questions,
+        } if task.requirement_analysis else None,
+        "implementation_plan": {
+            "id": task.implementation_plan.id,
+            "summary": task.implementation_plan.summary,
+            "repository_understanding": task.implementation_plan.repository_understanding,
+            "confirmed_observations": task.implementation_plan.confirmed_observations,
+            "files_to_create": task.implementation_plan.files_to_create,
+            "files_to_modify": task.implementation_plan.files_to_modify,
+            "api_contract_changes": task.implementation_plan.api_contract_changes,
+            "implementation_steps": task.implementation_plan.implementation_steps,
+            "dependencies": task.implementation_plan.dependencies,
+            "testing_strategy": task.implementation_plan.testing_strategy,
+            "risks_and_assumptions": task.implementation_plan.risks_and_assumptions,
+        } if task.implementation_plan else None,
+        "approvals": [
+            {
+                "id": a.id,
+                "decision": a.decision,
+                "feedback": a.feedback,
+                "decided_at": a.decided_at.isoformat(),
+            }
+            for a in task.approvals
+        ],
+    }
+
+
+@router.post("/{task_id}/pipeline", summary="Execute Full Intelligence & Planning Pipeline")
+async def run_task_pipeline(
+    task_id: str,
+    x_github_token: Optional[str] = Header(None, alias="X-GitHub-Token"),
+    db: Session = Depends(get_db),
+):
+    """Run the complete Chapter 2 pipeline:
+
+    1. Inspect codebase.
+    2. Run Product Analyst Agent.
+    3. Run Architect Agent.
+    4. Save plan and transition to AWAITING_APPROVAL.
+    """
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+
+    repo = task.repository
+    github_client = GitHubClient(token=x_github_token)
+
+    try:
+        # Step 1: Repository Inspection
+        task.status = "INSPECTING"
+        db.commit()
+
+        inspection_service = InspectionService(github_client=github_client)
+        inspection_data = await inspection_service.inspect_repository(
+            owner=repo.owner,
+            repo=repo.name,
+            default_branch=repo.default_branch,
+        )
+
+        # Upsert InspectionResult
+        if task.inspection:
+            db.delete(task.inspection)
+            db.flush()
+
+        insp_record = InspectionResult(
+            task_id=task.id,
+            tree_summary=inspection_data.get("tree_summary", {}),
+            detected_languages=inspection_data.get("detected_languages", []),
+            detected_frameworks=inspection_data.get("detected_frameworks", []),
+            detected_entrypoints=inspection_data.get("detected_entrypoints", []),
+            manifests_summary=inspection_data.get("manifests_summary", {}),
+            confirmed_facts=inspection_data.get("confirmed_facts", []),
+            unknowns=inspection_data.get("unknowns", []),
+        )
+        db.add(insp_record)
+
+        # Step 2: Product Analyst Agent
+        task.status = "ANALYZING"
+        db.commit()
+
+        analyst_agent = ProductAnalystAgent()
+        analysis_output = await analyst_agent.analyze(
+            requirement=task.user_requirement,
+            repo_context=inspection_data,
+        )
+
+        if task.requirement_analysis:
+            db.delete(task.requirement_analysis)
+            db.flush()
+
+        req_record = RequirementAnalysis(
+            task_id=task.id,
+            requirement_summary=analysis_output.requirement_summary,
+            functional_requirements=analysis_output.functional_requirements,
+            nonfunctional_requirements=analysis_output.nonfunctional_requirements,
+            acceptance_criteria=analysis_output.acceptance_criteria,
+            ambiguities=analysis_output.ambiguities,
+            clarification_questions=analysis_output.clarification_questions,
+            raw_llm_response=analysis_output.model_dump(),
+        )
+        db.add(req_record)
+
+        # Step 3: Architect Agent
+        task.status = "PLANNING"
+        db.commit()
+
+        architect_agent = ArchitectAgent()
+        plan_output = await architect_agent.plan(
+            analysis=analysis_output,
+            repo_inspection=inspection_data,
+        )
+
+        if task.implementation_plan:
+            db.delete(task.implementation_plan)
+            db.flush()
+
+        plan_record = ImplementationPlan(
+            task_id=task.id,
+            summary=plan_output.summary,
+            repository_understanding=plan_output.repository_understanding,
+            confirmed_observations=plan_output.confirmed_observations,
+            files_to_create=[f.model_dump() for f in plan_output.files_to_create],
+            files_to_modify=[f.model_dump() for f in plan_output.files_to_modify],
+            api_contract_changes=[a.model_dump() for a in plan_output.api_contract_changes],
+            implementation_steps=[s.model_dump() for s in plan_output.implementation_steps],
+            dependencies=plan_output.dependencies,
+            testing_strategy=plan_output.testing_strategy,
+            risks_and_assumptions=plan_output.risks_and_assumptions,
+            raw_llm_response=plan_output.model_dump(),
+        )
+        db.add(plan_record)
+
+        # Final transition to AWAITING_APPROVAL
+        task.status = "AWAITING_APPROVAL"
+        db.commit()
+
+        return get_task(task_id=task.id, db=db)
+
+    except GitHubError as e:
+        task.status = "FAILED"
+        db.commit()
+        raise HTTPException(status_code=e.status_code, detail=f"GitHub Error: {str(e)}")
+    except Exception as e:
+        logger.error(f"Pipeline execution failure on task {task_id}: {e}", exc_info=True)
+        task.status = "FAILED"
+        db.commit()
+        raise HTTPException(status_code=500, detail=f"Planning pipeline failed: {str(e)}")
+
+
+@router.post("/{task_id}/approval", summary="Record Human Plan Review Decision")
+def record_plan_approval(
+    task_id: str,
+    payload: ApprovalRequest,
+    db: Session = Depends(get_db),
+):
+    """Record human approval, rejection, or change request for the implementation plan.
+
+    STRICT SAFETY RULE: Approving a plan must NOT trigger code modifications in this chapter.
+    """
+    decision = payload.decision.upper()
+    if decision not in ("APPROVED", "REJECTED", "CHANGES_REQUESTED"):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid decision. Must be APPROVED, REJECTED, or CHANGES_REQUESTED.",
+        )
+
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+
+    if not task.implementation_plan:
+        raise HTTPException(status_code=400, detail="Cannot review a task without an implementation plan.")
+
+    approval = PlanApproval(
+        task_id=task.id,
+        plan_id=task.implementation_plan.id,
+        decision=decision,
+        feedback=payload.feedback,
+    )
+    db.add(approval)
+
+    # Update task state
+    task.status = decision
+    db.commit()
+    db.refresh(approval)
+
+    return {
+        "status": "recorded",
+        "task_id": task.id,
+        "decision": decision,
+        "message": (
+            "Plan approved! Chapter 2 requirement satisfied. "
+            "No autonomous code modification will be executed until Chapter 3 engine is activated."
+            if decision == "APPROVED"
+            else f"Plan decision recorded as {decision}."
+        ),
+        "approval": {
+            "id": approval.id,
+            "decision": approval.decision,
+            "feedback": approval.feedback,
+            "decided_at": approval.decided_at.isoformat(),
+        },
+    }
