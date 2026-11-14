@@ -11,8 +11,8 @@ import {
 } from "@/components/ui/Icons";
 
 interface SidebarProps {
-  activeTab?: "diagnostics" | "planning";
-  onTabChange?: (tab: "diagnostics" | "planning") => void;
+  activeTab?: "diagnostics" | "planning" | "execution";
+  onTabChange?: (tab: "diagnostics" | "planning" | "execution") => void;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -32,8 +32,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
     {
       num: 2,
       title: "Repo Intelligence",
-      completed: false,
-      active: activeTab === "planning",
+      completed: true,
+      active: false,
       desc: "GitHub, Codebase Analysis, Architect Agent",
       icon: GitBranch,
       tab: "planning" as const,
@@ -42,9 +42,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
       num: 3,
       title: "Autonomous Engine",
       completed: false,
-      active: false,
+      active: activeTab === "planning" || activeTab === "execution",
       desc: "Developer Agent, Isolated Sandbox, Git",
       icon: Cpu,
+      tab: "execution" as const,
     },
     {
       num: 4,
@@ -142,17 +143,20 @@ export const Sidebar: React.FC<SidebarProps> = ({
               <FileCode className="w-4 h-4 text-gray-400" />
               <span>Swagger API Docs</span>
             </a>
-            <div className="flex items-center gap-2 px-2.5 py-2 rounded-md text-gray-600 cursor-not-allowed">
-              <Sliders className="w-4 h-4 text-gray-600" />
+            <button
+              onClick={() => onTabChange && onTabChange("execution")}
+              className="w-full flex items-center gap-2 px-2.5 py-2 rounded-md text-gray-400 hover:text-gray-200 hover:bg-gray-900/60 text-left transition-colors"
+            >
+              <Sliders className="w-4 h-4 text-purple-400" />
               <span>Execution Sandbox (Ch. 3)</span>
-            </div>
+            </button>
           </div>
         </div>
       </div>
 
       <div className="p-4 border-t border-gray-800 text-[11px] text-gray-500 space-y-1">
         <p>DevPilot Multi-Agent System</p>
-        <p className="text-[10px] text-blue-400/80">Chapter 2 Active</p>
+        <p className="text-[10px] text-purple-400/90 font-medium">Chapter 3 Active</p>
       </div>
     </aside>
   );

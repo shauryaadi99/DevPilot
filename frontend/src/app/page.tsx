@@ -55,7 +55,7 @@ import {
 } from "@/components/ui/Icons";
 
 export default function WorkspacePage() {
-  const [activeTab, setActiveTab] = useState<"planning" | "diagnostics">("planning");
+  const [activeTab, setActiveTab] = useState<"planning" | "diagnostics" | "execution">("planning");
 
   // Chapter 1 Diagnostics State
   const [health, setHealth] = useState<HealthResponse | null>(null);
@@ -327,19 +327,19 @@ export default function WorkspacePage() {
 
         <main className="flex-1 overflow-y-auto p-6 md:p-8 space-y-6">
           {/* Chapter 2: Repo Intelligence & Planning View */}
-          {activeTab === "planning" && (
+          {(activeTab === "planning" || activeTab === "execution") && (
             <div className="space-y-6">
               {/* Header Title */}
               <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-6 border-b border-gray-800">
                 <div>
                   <div className="flex items-center gap-2">
                     <h1 className="text-2xl font-bold tracking-tight text-white">
-                      Chapter 2 — Repository Intelligence & Planning
+                      Chapter 3 — Autonomous Development Engine
                     </h1>
-                    <StatusBadge status="ACTIVE" label="CHAPTER 2 ACTIVE" />
+                    <StatusBadge status="ACTIVE" label="CHAPTER 3 ACTIVE" />
                   </div>
                   <p className="text-sm text-gray-400 mt-1">
-                    Connect a GitHub repository, inspect codebases, and generate repository-aware implementation plans with Product Analyst & Architect Agents.
+                    Connect repository, analyze requirements, formulate architecture-aware plans, and autonomously implement approved changes via Developer Agent in an isolated sandbox.
                   </p>
                 </div>
 

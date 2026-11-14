@@ -94,3 +94,4 @@ def test_sandbox_info_metadata():
     assert "cpu_limit" in info
     assert "timeout_seconds" in info
     assert info["secrets_stripped"] is True
+
