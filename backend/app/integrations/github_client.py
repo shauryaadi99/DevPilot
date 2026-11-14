@@ -151,6 +151,12 @@ class GitHubClient:
                 logger.error(f"GitHub tree fetch error: {e}")
                 raise GitHubError("Failed to fetch repository tree.", status_code=503)
 
+        if res.status_code == 409:
+            raise GitHubError(
+                f"Repository '{owner}/{repo}' is completely empty on GitHub (0 commits). Please push code to this repository before inspecting.",
+                status_code=409,
+            )
+
         if res.status_code == 404:
             # Try master branch if main not found
             if branch == "main":
@@ -196,3 +202,4 @@ class GitHubClient:
             except Exception:
                 return None
         return None
+

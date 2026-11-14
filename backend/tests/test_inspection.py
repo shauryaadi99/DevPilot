@@ -41,3 +41,4 @@ async def test_inspection_service_detection():
     assert "package.json" in result["manifests_summary"]
     assert len(result["confirmed_facts"]) > 0
     assert len(result["unknowns"]) > 0
+

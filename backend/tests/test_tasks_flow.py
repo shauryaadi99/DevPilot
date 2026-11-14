@@ -99,3 +99,160 @@ def test_task_creation_and_approval_flow(client):
     assert detail["status"] == "APPROVED"
     assert len(detail["approvals"]) == 1
     assert detail["approvals"][0]["decision"] == "APPROVED"
+
+
+def test_changes_requested_closed_loop_replanning(client):
+    """Verify that requesting changes triggers closed-loop re-planning and updates the plan."""
+    from app.agents.schemas import (
+        ProductAnalystOutput,
+        ArchitectPlanOutput,
+        FileToCreate,
+        FileToModify,
+        ImplementationStep,
+    )
+
+    # 1. Setup Repo and Task
+    repo_payload = {
+        "github_id": 99995678,
+        "name": "auth-service",
+        "full_name": "bit/auth-service",
+        "owner": "bit",
+        "default_branch": "main",
+        "is_private": False,
+        "html_url": "https://github.com/bit/auth-service",
+    }
+    repo_res = client.post("/api/v1/github/select", json=repo_payload)
+    repo_id = repo_res.json()["repository"]["id"]
+
+    task_payload = {
+        "repository_id": repo_id,
+        "title": "Add Password Reset",
+        "requirement": "Add password reset flow.",
+    }
+    task_res = client.post("/api/v1/tasks", json=task_payload)
+    task_id = task_res.json()["id"]
+
+    mock_inspection = {
+        "tree_summary": {"total_files": 3, "key_paths": ["app/auth.py"]},
+        "detected_languages": ["Python"],
+        "detected_frameworks": ["FastAPI"],
+        "detected_entrypoints": ["app/auth.py"],
+        "manifests_summary": {},
+        "confirmed_facts": [],
+        "unknowns": [],
+    }
+
+    initial_analysis = ProductAnalystOutput(
+        requirement_summary="Initial password reset analysis",
+        functional_requirements=["Send email reset link"],
+        nonfunctional_requirements=[],
+        acceptance_criteria=["Email received"],
+        ambiguities=[],
+        clarification_questions=[],
+    )
+    initial_plan = ArchitectPlanOutput(
+        summary="Initial Plan: Store token in memory",
+        repository_understanding="FastAPI auth service",
+        confirmed_observations=[],
+        files_to_create=[],
+        files_to_modify=[FileToModify(path="app/auth.py", reason="Add endpoint", changes_summary="Add reset")],
+        api_contract_changes=[],
+        implementation_steps=[ImplementationStep(step_number=1, title="Add route", description="Memory token", affected_files=["app/auth.py"])],
+        dependencies=[],
+        testing_strategy={"unit_tests": ["Test reset"]},
+        risks_and_assumptions=[],
+    )
+
+    with patch("app.services.inspection_service.InspectionService.inspect_repository", return_value=mock_inspection), \
+         patch("app.agents.product_analyst.ProductAnalystAgent.analyze", return_value=initial_analysis), \
+         patch("app.agents.architect.ArchitectAgent.plan", return_value=initial_plan):
+
+        pipeline_res = client.post(f"/api/v1/tasks/{task_id}/pipeline")
+        assert pipeline_res.status_code == 200
+        assert pipeline_res.json()["implementation_plan"]["summary"] == "Initial Plan: Store token in memory"
+
+    # 2. Submit CHANGES_REQUESTED with detailed feedback
+    revised_analysis = ProductAnalystOutput(
+        requirement_summary="Revised password reset with MongoDB and hash",
+        functional_requirements=["Store token in MongoDB", "Hash password with bcrypt"],
+        nonfunctional_requirements=["15 min token expiry"],
+        acceptance_criteria=["Password hashed in DB", "Expired tokens rejected"],
+        ambiguities=[],
+        clarification_questions=[],
+    )
+    revised_plan = ArchitectPlanOutput(
+        summary="Revised Plan: MongoDB token storage with bcrypt hashing and 15min expiry",
+        repository_understanding="FastAPI auth service with MongoDB",
+        confirmed_observations=["MongoDB client used"],
+        files_to_create=[FileToCreate(path="app/services/token_service.py", purpose="Token management")],
+        files_to_modify=[FileToModify(path="app/auth.py", reason="Update reset endpoint", changes_summary="Use token service")],
+        api_contract_changes=[],
+        implementation_steps=[
+            ImplementationStep(step_number=1, title="Create token service", description="Token lifecycle", affected_files=["app/services/token_service.py"]),
+            ImplementationStep(step_number=2, title="Update auth route", description="Call token service", affected_files=["app/auth.py"]),
+        ],
+        dependencies=["bcrypt", "motor"],
+        testing_strategy={"unit_tests": ["Test token expiry", "Test bcrypt hash"]},
+        risks_and_assumptions=["MongoDB availability"],
+    )
+
+    feedback_text = "Store reset tokens in MongoDB with 15min expiration and hash new passwords using bcrypt."
+    with patch("app.agents.product_analyst.ProductAnalystAgent.analyze", return_value=revised_analysis) as mock_analyze, \
+         patch("app.agents.architect.ArchitectAgent.plan", return_value=revised_plan) as mock_plan:
+
+        changes_res = client.post(
+            f"/api/v1/tasks/{task_id}/approval",
+            json={"decision": "CHANGES_REQUESTED", "feedback": feedback_text},
+        )
+        assert changes_res.status_code == 200
+        changes_data = changes_res.json()
+
+        # Verify response structure and message
+        assert changes_data["status"] == "recorded"
+        assert changes_data["decision"] == "CHANGES_REQUESTED"
+        assert "Plan revised to incorporate review feedback" in changes_data["message"]
+        assert changes_data["task"] is not None
+
+        # Verify returned task has updated plan and AWAITING_APPROVAL status
+        updated_task = changes_data["task"]
+        assert updated_task["status"] == "AWAITING_APPROVAL"
+        assert updated_task["implementation_plan"]["summary"] == "Revised Plan: MongoDB token storage with bcrypt hashing and 15min expiry"
+        assert len(updated_task["implementation_plan"]["files_to_create"]) == 1
+        assert updated_task["implementation_plan"]["files_to_create"][0]["path"] == "app/services/token_service.py"
+        assert len(updated_task["implementation_plan"]["implementation_steps"]) == 2
+
+        # Verify agents were called with feedback and previous state
+        mock_analyze.assert_called_once()
+        _, analyze_kwargs = mock_analyze.call_args
+        assert analyze_kwargs["user_feedback"] == feedback_text
+        assert analyze_kwargs["previous_analysis"] is not None
+
+        mock_plan.assert_called_once()
+        _, plan_kwargs = mock_plan.call_args
+        assert plan_kwargs["user_feedback"] == feedback_text
+        assert plan_kwargs["previous_plan"] is not None
+
+    # 3. Verify GET /tasks/{task_id} reflects the revised plan in the database
+    get_res = client.get(f"/api/v1/tasks/{task_id}")
+    assert get_res.status_code == 200
+    current = get_res.json()
+    assert current["status"] == "AWAITING_APPROVAL"
+    assert current["implementation_plan"]["summary"] == "Revised Plan: MongoDB token storage with bcrypt hashing and 15min expiry"
+    assert len(current["approvals"]) == 1
+    assert current["approvals"][0]["decision"] == "CHANGES_REQUESTED"
+    assert current["approvals"][0]["feedback"] == feedback_text
+
+    # 4. Now Human Approves the REVISED plan
+    final_approval_res = client.post(
+        f"/api/v1/tasks/{task_id}/approval",
+        json={"decision": "APPROVED", "feedback": "Revised plan looks great!"},
+    )
+    assert final_approval_res.status_code == 200
+    final_data = final_approval_res.json()
+    assert final_data["decision"] == "APPROVED"
+    assert final_data["task"]["status"] == "APPROVED"
+    # Verify the approved plan is the revised plan
+    assert final_data["task"]["implementation_plan"]["summary"] == "Revised Plan: MongoDB token storage with bcrypt hashing and 15min expiry"
+    assert len(final_data["task"]["approvals"]) == 2
+
+

@@ -78,6 +78,8 @@ export default function WorkspacePage() {
   // Approval Modal/State
   const [approvalFeedback, setApprovalFeedback] = useState<string>("");
   const [submittingApproval, setSubmittingApproval] = useState<boolean>(false);
+  const [approvalAction, setApprovalAction] = useState<string | null>(null);
+  const [planRevisionMessage, setPlanRevisionMessage] = useState<string | null>(null);
 
   const loadHealthData = async () => {
     try {
@@ -184,28 +186,55 @@ export default function WorkspacePage() {
 
   const handleApprovalDecision = async (decision: "APPROVED" | "REJECTED" | "CHANGES_REQUESTED") => {
     if (!currentTask) return;
+
+    if (decision === "CHANGES_REQUESTED" && !approvalFeedback.trim()) {
+      setPipelineError("Please enter your review feedback or requested changes below before clicking 'Request Changes'.");
+      return;
+    }
+
     try {
       setSubmittingApproval(true);
-      const result = await submitPlanApproval(currentTask.id, decision, approvalFeedback);
-      // Update local task status and append approval
-      setCurrentTask({
-        ...currentTask,
-        status: decision,
-        approvals: [
-          ...currentTask.approvals,
-          {
-            id: result.approval.id,
-            decision: result.approval.decision,
-            feedback: result.approval.feedback,
-            decided_at: result.approval.decided_at,
-          },
-        ],
-      });
+      setApprovalAction(decision);
+      setPipelineError(null);
+      setPlanRevisionMessage(null);
+
+      const result = await submitPlanApproval(currentTask.id, decision, approvalFeedback.trim() || undefined);
+
+      if (result.task) {
+        setCurrentTask(result.task);
+      } else {
+        // Fallback: update local task status and append approval
+        setCurrentTask({
+          ...currentTask,
+          status: decision,
+          approvals: [
+            ...currentTask.approvals,
+            {
+              id: result.approval.id,
+              decision: result.approval.decision,
+              feedback: result.approval.feedback,
+              decided_at: result.approval.decided_at,
+            },
+          ],
+        });
+      }
+
+      if (decision === "CHANGES_REQUESTED") {
+        setPlanRevisionMessage(
+          result.message || "Plan revised by Product Analyst & Architect Agents based on your feedback! Ready for re-review."
+        );
+      } else if (decision === "APPROVED") {
+        setPlanRevisionMessage(
+          result.message || "Plan approved! Chapter 2 review complete. No autonomous code modification permitted in this chapter."
+        );
+      }
+
       setApprovalFeedback("");
     } catch (err: any) {
       setPipelineError(err?.message || "Failed to submit approval.");
     } finally {
       setSubmittingApproval(false);
+      setApprovalAction(null);
     }
   };
 
@@ -701,7 +730,8 @@ export default function WorkspacePage() {
                               disabled={submittingApproval || currentTask.status === "APPROVED"}
                               className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold text-white transition-colors disabled:opacity-50 flex items-center gap-1.5 shadow-md shadow-emerald-900/20"
                             >
-                              <Check className="w-3.5 h-3.5" /> Approve Plan
+                              <Check className="w-3.5 h-3.5" />
+                              {submittingApproval && approvalAction === "APPROVED" ? "Approving..." : "Approve Plan"}
                             </button>
 
                             <button
@@ -709,7 +739,8 @@ export default function WorkspacePage() {
                               disabled={submittingApproval}
                               className="px-4 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 text-xs font-semibold text-white transition-colors disabled:opacity-50 flex items-center gap-1.5"
                             >
-                              <MessageSquare className="w-3.5 h-3.5" /> Request Changes
+                              <MessageSquare className="w-3.5 h-3.5" />
+                              {submittingApproval && approvalAction === "CHANGES_REQUESTED" ? "Revising Plan..." : "Request Changes"}
                             </button>
 
                             <button
@@ -717,16 +748,41 @@ export default function WorkspacePage() {
                               disabled={submittingApproval}
                               className="px-4 py-2 rounded-lg bg-rose-600 hover:bg-rose-500 text-xs font-semibold text-white transition-colors disabled:opacity-50 flex items-center gap-1.5"
                             >
-                              <X className="w-3.5 h-3.5" /> Reject Plan
+                              <X className="w-3.5 h-3.5" />
+                              {submittingApproval && approvalAction === "REJECTED" ? "Rejecting..." : "Reject Plan"}
                             </button>
                           </div>
                         </div>
+
+                        {/* Re-planning in-progress indicator */}
+                        {submittingApproval && approvalAction === "CHANGES_REQUESTED" && (
+                          <div className="flex items-center gap-2.5 p-3.5 rounded-lg bg-amber-950/40 border border-amber-800/60 text-amber-200 text-xs animate-pulse">
+                            <RefreshCw className="w-4 h-4 animate-spin text-amber-400 shrink-0" />
+                            <div>
+                              <div className="font-semibold text-amber-300">Revising Implementation Plan</div>
+                              <p className="text-[11px] text-amber-200/80 mt-0.5">
+                                Re-running Product Analyst and Architect agents to incorporate your review feedback into the files, steps, and test strategy...
+                              </p>
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Plan revision success message */}
+                        {planRevisionMessage && !submittingApproval && (
+                          <div className="flex items-start gap-2.5 p-3.5 rounded-lg bg-emerald-950/40 border border-emerald-800/60 text-emerald-200 text-xs">
+                            <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                            <div>
+                              <div className="font-semibold text-emerald-300">Review Update</div>
+                              <p className="text-[11px] text-emerald-200/80 mt-0.5">{planRevisionMessage}</p>
+                            </div>
+                          </div>
+                        )}
 
                         {/* Optional Feedback Input */}
                         <div className="pt-2">
                           <input
                             type="text"
-                            placeholder="Optional review feedback or requested changes..."
+                            placeholder="Enter review feedback or requested changes (e.g. 'Use Redis for token storage and hash with bcrypt')..."
                             value={approvalFeedback}
                             onChange={(e) => setApprovalFeedback(e.target.value)}
                             className="w-full px-3 py-2 rounded-lg bg-gray-950 border border-gray-800 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-blue-500"

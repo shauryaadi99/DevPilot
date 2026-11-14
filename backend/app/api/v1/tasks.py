@@ -2,6 +2,7 @@
 
 Handles requirement submission, repository inspection, Product Analyst analysis,
 Architect planning, and persistent human approval workflows.
+Includes closed-loop re-planning when changes are requested by human review.
 """
 
 from typing import Any, Dict, List, Optional
@@ -22,6 +23,14 @@ from app.integrations.github_client import GitHubClient, GitHubError
 from app.services.inspection_service import InspectionService
 from app.agents.product_analyst import ProductAnalystAgent
 from app.agents.architect import ArchitectAgent
+from app.agents.schemas import (
+    ProductAnalystOutput,
+    ArchitectPlanOutput,
+    FileToCreate,
+    FileToModify,
+    ApiContractChange,
+    ImplementationStep,
+)
 from app.core.logging import logger
 
 router = APIRouter(prefix="/api/v1/tasks", tags=["Tasks & Planning"])
@@ -251,12 +260,15 @@ async def run_task_pipeline(
 
 
 @router.post("/{task_id}/approval", summary="Record Human Plan Review Decision")
-def record_plan_approval(
+async def record_plan_approval(
     task_id: str,
     payload: ApprovalRequest,
     db: Session = Depends(get_db),
 ):
     """Record human approval, rejection, or change request for the implementation plan.
+
+    If CHANGES_REQUESTED is submitted with feedback, automatically executes a closed-loop
+    re-planning cycle with Product Analyst and Architect agents to revise the plan.
 
     STRICT SAFETY RULE: Approving a plan must NOT trigger code modifications in this chapter.
     """
@@ -274,6 +286,7 @@ def record_plan_approval(
     if not task.implementation_plan:
         raise HTTPException(status_code=400, detail="Cannot review a task without an implementation plan.")
 
+    # Record persistent approval row
     approval = PlanApproval(
         task_id=task.id,
         plan_id=task.implementation_plan.id,
@@ -281,11 +294,93 @@ def record_plan_approval(
         feedback=payload.feedback,
     )
     db.add(approval)
-
-    # Update task state
     task.status = decision
     db.commit()
     db.refresh(approval)
+
+    # If CHANGES_REQUESTED, trigger closed-loop plan revision
+    if decision == "CHANGES_REQUESTED" and payload.feedback and payload.feedback.strip():
+        logger.info(f"Closed-loop re-planning triggered for task {task.id} with feedback: {payload.feedback}")
+
+        inspection_data = {
+            "tree_summary": task.inspection.tree_summary if task.inspection else {},
+            "detected_languages": task.inspection.detected_languages if task.inspection else [],
+            "detected_frameworks": task.inspection.detected_frameworks if task.inspection else [],
+            "detected_entrypoints": task.inspection.detected_entrypoints if task.inspection else [],
+            "manifests_summary": task.inspection.manifests_summary if task.inspection else {},
+            "confirmed_facts": task.inspection.confirmed_facts if task.inspection else [],
+            "unknowns": task.inspection.unknowns if task.inspection else [],
+        }
+
+        # 1. Revise Requirement Analysis with feedback
+        analyst_agent = ProductAnalystAgent()
+        prev_analysis = None
+        if task.requirement_analysis:
+            prev_analysis = ProductAnalystOutput(
+                requirement_summary=task.requirement_analysis.requirement_summary,
+                functional_requirements=task.requirement_analysis.functional_requirements,
+                nonfunctional_requirements=task.requirement_analysis.nonfunctional_requirements,
+                acceptance_criteria=task.requirement_analysis.acceptance_criteria,
+                ambiguities=task.requirement_analysis.ambiguities,
+                clarification_questions=task.requirement_analysis.clarification_questions,
+            )
+
+        revised_analysis = await analyst_agent.analyze(
+            requirement=task.user_requirement,
+            repo_context=inspection_data,
+            user_feedback=payload.feedback,
+            previous_analysis=prev_analysis,
+        )
+
+        if task.requirement_analysis:
+            task.requirement_analysis.requirement_summary = revised_analysis.requirement_summary
+            task.requirement_analysis.functional_requirements = revised_analysis.functional_requirements
+            task.requirement_analysis.nonfunctional_requirements = revised_analysis.nonfunctional_requirements
+            task.requirement_analysis.acceptance_criteria = revised_analysis.acceptance_criteria
+            task.requirement_analysis.ambiguities = revised_analysis.ambiguities
+            task.requirement_analysis.clarification_questions = revised_analysis.clarification_questions
+            task.requirement_analysis.raw_llm_response = revised_analysis.model_dump()
+
+        # 2. Revise Architect Plan with feedback
+        architect_agent = ArchitectAgent()
+        prev_plan = None
+        if task.implementation_plan:
+            prev_plan = ArchitectPlanOutput(
+                summary=task.implementation_plan.summary,
+                repository_understanding=task.implementation_plan.repository_understanding,
+                confirmed_observations=task.implementation_plan.confirmed_observations,
+                files_to_create=[FileToCreate(**f) for f in task.implementation_plan.files_to_create],
+                files_to_modify=[FileToModify(**f) for f in task.implementation_plan.files_to_modify],
+                api_contract_changes=[ApiContractChange(**a) for a in task.implementation_plan.api_contract_changes],
+                implementation_steps=[ImplementationStep(**s) for s in task.implementation_plan.implementation_steps],
+                dependencies=task.implementation_plan.dependencies,
+                testing_strategy=task.implementation_plan.testing_strategy,
+                risks_and_assumptions=task.implementation_plan.risks_and_assumptions,
+            )
+
+        revised_plan = await architect_agent.plan(
+            analysis=revised_analysis,
+            repo_inspection=inspection_data,
+            user_feedback=payload.feedback,
+            previous_plan=prev_plan,
+        )
+
+        # Update ImplementationPlan in database
+        task.implementation_plan.summary = revised_plan.summary
+        task.implementation_plan.repository_understanding = revised_plan.repository_understanding
+        task.implementation_plan.confirmed_observations = revised_plan.confirmed_observations
+        task.implementation_plan.files_to_create = [f.model_dump() for f in revised_plan.files_to_create]
+        task.implementation_plan.files_to_modify = [f.model_dump() for f in revised_plan.files_to_modify]
+        task.implementation_plan.api_contract_changes = [a.model_dump() for a in revised_plan.api_contract_changes]
+        task.implementation_plan.implementation_steps = [s.model_dump() for s in revised_plan.implementation_steps]
+        task.implementation_plan.dependencies = revised_plan.dependencies
+        task.implementation_plan.testing_strategy = revised_plan.testing_strategy
+        task.implementation_plan.risks_and_assumptions = revised_plan.risks_and_assumptions
+        task.implementation_plan.raw_llm_response = revised_plan.model_dump()
+
+        # Transition task back to AWAITING_APPROVAL with revised plan
+        task.status = "AWAITING_APPROVAL"
+        db.commit()
 
     return {
         "status": "recorded",
@@ -295,6 +390,8 @@ def record_plan_approval(
             "Plan approved! Chapter 2 requirement satisfied. "
             "No autonomous code modification will be executed until Chapter 3 engine is activated."
             if decision == "APPROVED"
+            else "Plan revised to incorporate review feedback! Task is ready for re-review."
+            if decision == "CHANGES_REQUESTED"
             else f"Plan decision recorded as {decision}."
         ),
         "approval": {
@@ -303,4 +400,5 @@ def record_plan_approval(
             "feedback": approval.feedback,
             "decided_at": approval.decided_at.isoformat(),
         },
+        "task": get_task(task_id=task.id, db=db),
     }

@@ -171,3 +171,4 @@ class InspectionService:
             "confirmed_facts": confirmed_facts,
             "unknowns": unknowns,
         }
+

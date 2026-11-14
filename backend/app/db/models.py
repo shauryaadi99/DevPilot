@@ -153,3 +153,4 @@ class PlanApproval(Base):
     # Relationships
     task: Mapped["Task"] = relationship("Task", back_populates="approvals")
     plan: Mapped["ImplementationPlan"] = relationship("ImplementationPlan", back_populates="approvals")
+

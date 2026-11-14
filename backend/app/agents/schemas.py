@@ -56,3 +56,4 @@ class ArchitectPlanOutput(BaseModel):
     dependencies: List[str] = Field(description="Any new libraries or packages required (prefer zero).")
     testing_strategy: Dict[str, Any] = Field(description="Test plan covering unit, integration, and verification steps.")
     risks_and_assumptions: List[str] = Field(description="Identified risks, edge cases, and explicit assumptions made.")
+
