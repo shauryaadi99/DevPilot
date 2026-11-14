@@ -278,7 +278,7 @@ export default function WorkspacePage() {
                 <div className="flex items-center gap-2">
                   <span className="text-xs text-gray-400 font-mono">Model:</span>
                   <span className="text-xs px-2.5 py-1 rounded-md bg-blue-950/60 border border-blue-800/60 text-blue-300 font-mono">
-                    qwen/qwen3.8-27b
+                    {health?.components.llm.model || "openai/gpt-oss-120b"}
                   </span>
                 </div>
               </div>
@@ -460,6 +460,27 @@ export default function WorkspacePage() {
                     <div className="flex flex-wrap items-center justify-between gap-3 pt-2">
                       <div className="flex items-center gap-2">
                         <span className="text-[11px] text-gray-500">Quick Prompts:</span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setTaskTitle("Add Password Reset Functionality");
+                            setTaskRequirement(
+                              "Implement a secure password reset feature in the existing TaskFlow application.\n\n" +
+                              "Requirements:\n" +
+                              "1. Add a Forgot Password option to the login page.\n" +
+                              "2. Allow users to request a password reset using their registered email address.\n" +
+                              "3. Generate a secure, unique, time-limited reset token.\n" +
+                              "4. Allow users to reset their password using the token.\n" +
+                              "5. Hash the new password before storing it in MongoDB.\n" +
+                              "6. Ensure reset tokens expire and cannot be reused.\n" +
+                              "7. Add appropriate backend API endpoints and frontend UI.\n" +
+                              "8. Include validation, error handling and security checks."
+                            );
+                          }}
+                          className="text-[10px] px-2 py-1 rounded bg-blue-900/40 hover:bg-blue-800/60 text-blue-300 border border-blue-700/50"
+                        >
+                          Password Reset (MERN)
+                        </button>
                         <button
                           type="button"
                           onClick={() => {
@@ -922,7 +943,7 @@ export default function WorkspacePage() {
 
                   <div>
                     <div className="text-lg font-semibold text-white truncate">
-                      {health?.components.llm.model || "qwen/qwen3.8-27b"}
+                      {health?.components.llm.model || "openai/gpt-oss-120b"}
                     </div>
                     <p className="text-xs text-gray-400 mt-0.5">
                       Provider: <span className="text-gray-300 font-mono">Groq Cloud</span>

@@ -119,49 +119,37 @@ Produce the structured architecture and implementation plan now in JSON format."
 
         logger.info(f"Running Architect Agent (feedback present: {bool(user_feedback)}) using model {self.groq_provider.model}")
 
-        try:
-            response = client.chat.completions.create(
-                model=self.groq_provider.model,
-                messages=messages,
-                response_format={"type": "json_object"},
-                temperature=0.2,
-                max_tokens=3072,
-            )
-            raw_json = response.choices[0].message.content or "{}"
-            output = ArchitectPlanOutput.model_validate_json(raw_json)
-            return output
-        except Exception as e:
-            logger.error(f"Architect Agent execution failed: {e}")
-            # Fallback plan ensuring validity
-            return ArchitectPlanOutput(
-                summary=f"Implementation plan for: {analysis.requirement_summary}" + (f" (Revised with: {user_feedback[:60]})" if user_feedback else ""),
-                repository_understanding=f"Repository with detected stack: {', '.join(repo_inspection.get('detected_languages', ['Generic']))}",
-                confirmed_observations=confirmed_facts or ["Inspected repository file tree."],
-                files_to_create=[],
-                files_to_modify=[
-                    FileToModify(
-                        path=repo_inspection.get('detected_entrypoints', ['main'])[0] if repo_inspection.get('detected_entrypoints') else "README.md",
-                        reason="Implement the specified requirement with feedback.",
-                        changes_summary="Apply necessary modifications.",
-                    )
-                ],
-                api_contract_changes=[],
-                implementation_steps=[
-                    ImplementationStep(
-                        step_number=1,
-                        title="Implement requirement",
-                        description=f"Implement: {analysis.requirement_summary}",
-                        affected_files=[],
-                    )
-                ],
-                dependencies=[],
-                testing_strategy={
-                    "unit_tests": ["Execute existing project test suite."],
-                    "integration_tests": ["Verify end-to-end user requirement."],
-                    "manual_checks": ["Inspect affected components."],
-                },
-                risks_and_assumptions=[
-                    "Fallback plan used due to model response parsing error.",
-                    "Human verification required before applying changes.",
-                ],
-            )
+        models_to_try = [self.groq_provider.model]
+        for candidate in ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]:
+            if candidate not in models_to_try:
+                models_to_try.append(candidate)
+
+        last_error = None
+        for current_model in models_to_try:
+            try:
+                logger.info(f"Architect Agent attempting model {current_model}")
+                response = client.chat.completions.create(
+                    model=current_model,
+                    messages=messages,
+                    response_format={"type": "json_object"},
+                    temperature=0.2,
+                    max_tokens=2500,
+                )
+                raw_json = response.choices[0].message.content or "{}"
+                clean_json = raw_json.strip()
+                if clean_json.startswith("```"):
+                    lines = clean_json.split("\n")
+                    if lines[0].startswith("```"):
+                        lines = lines[1:]
+                    if lines and lines[-1].startswith("```"):
+                        lines = lines[:-1]
+                    clean_json = "\n".join(lines).strip()
+
+                output = ArchitectPlanOutput.model_validate_json(clean_json)
+                return output
+            except Exception as e:
+                last_error = e
+                logger.warning(f"Architect Agent model {current_model} failed: {e}. Trying fallback if available.")
+
+        logger.error(f"Architect Agent execution failed after all attempts: {last_error}")
+        raise RuntimeError(f"Architect Agent failed to generate implementation plan: {last_error}")

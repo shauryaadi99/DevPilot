@@ -87,26 +87,37 @@ Generate the structured requirement analysis now in JSON format."""
 
         logger.info(f"Running Product Analyst Agent (feedback present: {bool(user_feedback)}) using model {self.groq_provider.model}")
 
-        try:
-            response = client.chat.completions.create(
-                model=self.groq_provider.model,
-                messages=messages,
-                response_format={"type": "json_object"},
-                temperature=0.2,
-                max_tokens=2048,
-            )
-            raw_json = response.choices[0].message.content or "{}"
-            output = ProductAnalystOutput.model_validate_json(raw_json)
-            return output
-        except Exception as e:
-            logger.error(f"Product Analyst Agent execution failed: {e}")
-            # If JSON parsing or API failed, construct a structured fallback
-            combined_summary = f"{requirement[:100]} (Updated with feedback: {user_feedback[:50]})" if user_feedback else requirement[:100]
-            return ProductAnalystOutput(
-                requirement_summary=combined_summary,
-                functional_requirements=[requirement] + ([f"User feedback: {user_feedback}"] if user_feedback else []),
-                nonfunctional_requirements=["Maintain system security and existing functionality."],
-                acceptance_criteria=[f"Verify that the requested change: '{requirement[:80]}' is implemented and tested."],
-                ambiguities=["LLM generated response parsing required fallback handling."],
-                clarification_questions=[],
-            )
+        models_to_try = [self.groq_provider.model]
+        for candidate in ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]:
+            if candidate not in models_to_try:
+                models_to_try.append(candidate)
+
+        last_error = None
+        for current_model in models_to_try:
+            try:
+                logger.info(f"Product Analyst attempting model {current_model}")
+                response = client.chat.completions.create(
+                    model=current_model,
+                    messages=messages,
+                    response_format={"type": "json_object"},
+                    temperature=0.2,
+                    max_tokens=2048,
+                )
+                raw_json = response.choices[0].message.content or "{}"
+                clean_json = raw_json.strip()
+                if clean_json.startswith("```"):
+                    lines = clean_json.split("\n")
+                    if lines[0].startswith("```"):
+                        lines = lines[1:]
+                    if lines and lines[-1].startswith("```"):
+                        lines = lines[:-1]
+                    clean_json = "\n".join(lines).strip()
+
+                output = ProductAnalystOutput.model_validate_json(clean_json)
+                return output
+            except Exception as e:
+                last_error = e
+                logger.warning(f"Product Analyst model {current_model} failed: {e}. Trying fallback if available.")
+
+        logger.error(f"Product Analyst Agent execution failed after all attempts: {last_error}")
+        raise RuntimeError(f"Product Analyst Agent failed to analyze requirements: {last_error}")

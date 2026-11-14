@@ -40,8 +40,8 @@ class Settings(BaseSettings):
 
     # Groq LLM settings
     GROQ_API_KEY: str | None = None
-    GROQ_MODEL: str = "qwen/qwen3.8-27b"
-    GROQ_TIMEOUT_SECONDS: float = 30.0
+    GROQ_MODEL: str = "openai/gpt-oss-120b"
+    GROQ_TIMEOUT_SECONDS: float = 45.0
 
     model_config = SettingsConfigDict(
         env_file=(".env", "../.env"),

@@ -106,47 +106,100 @@ class InspectionService:
             f"Primary detected languages: {', '.join(detected_languages[:3]) or 'Unknown'}",
         ]
 
-        # Scan package.json
-        if "package.json" in manifests_summary:
-            try:
-                pkg_data = json.loads(manifests_summary["package.json"])
-                deps = {**pkg_data.get("dependencies", {}), **pkg_data.get("devDependencies", {})}
-                if "next" in deps:
-                    detected_frameworks.append("Next.js")
-                if "react" in deps:
-                    detected_frameworks.append("React")
-                if "express" in deps:
+        # Scan all package.json files (root and subprojects e.g., backend/, frontend/)
+        for m_path, m_content in manifests_summary.items():
+            if m_path.endswith("package.json"):
+                try:
+                    pkg_data = json.loads(m_content)
+                    deps = {**pkg_data.get("dependencies", {}), **pkg_data.get("devDependencies", {})}
+                    if "next" in deps and "Next.js" not in detected_frameworks:
+                        detected_frameworks.append("Next.js")
+                    if "react" in deps and "React" not in detected_frameworks:
+                        detected_frameworks.append("React")
+                    if "express" in deps and "Express.js" not in detected_frameworks:
+                        detected_frameworks.append("Express.js")
+                    if "mongoose" in deps:
+                        if "Mongoose" not in detected_frameworks:
+                            detected_frameworks.append("Mongoose")
+                        if "MongoDB" not in detected_frameworks:
+                            detected_frameworks.append("MongoDB")
+                    elif "mongodb" in deps and "MongoDB" not in detected_frameworks:
+                        detected_frameworks.append("MongoDB")
+                    if "vite" in deps and "Vite" not in detected_frameworks:
+                        detected_frameworks.append("Vite")
+                    if "tailwindcss" in deps and "Tailwind CSS" not in detected_frameworks:
+                        detected_frameworks.append("Tailwind CSS")
+
+                    # Identify existing security & auth dependencies
+                    if "bcrypt" in deps or "bcryptjs" in deps:
+                        hasher = "bcryptjs" if "bcryptjs" in deps else "bcrypt"
+                        confirmed_facts.append(f"Existing password hashing library: {hasher} (in {m_path})")
+                    if "jsonwebtoken" in deps:
+                        confirmed_facts.append(f"Existing JWT library: jsonwebtoken (in {m_path})")
+
+                    pkg_name = pkg_data.get("name")
+                    if pkg_name:
+                        confirmed_facts.append(f"Node.js package: {pkg_name} ({m_path})")
+                except Exception:
+                    pass
+
+        # Scan README for stack mentions if still missing
+        if "README.md" in manifests_summary:
+            readme_lower = manifests_summary["README.md"].lower()
+            if "mern" in readme_lower:
+                confirmed_facts.append("Identified stack pattern: MERN (MongoDB, Express, React, Node)")
+                if "MongoDB" not in detected_frameworks:
+                    detected_frameworks.append("MongoDB")
+                if "Express.js" not in detected_frameworks:
                     detected_frameworks.append("Express.js")
-                if "tailwindcss" in deps:
-                    detected_frameworks.append("Tailwind CSS")
-                confirmed_facts.append(f"Node.js package name: {pkg_data.get('name', 'unnamed')}")
-            except Exception:
-                pass
+                if "React" not in detected_frameworks:
+                    detected_frameworks.append("React")
 
         # Scan python requirements
         for py_man in ["requirements.txt", "pyproject.toml"]:
-            if py_man in manifests_summary:
-                p_text = manifests_summary[py_man].lower()
-                if "fastapi" in p_text:
-                    detected_frameworks.append("FastAPI")
-                if "django" in p_text:
-                    detected_frameworks.append("Django")
-                if "flask" in p_text:
-                    detected_frameworks.append("Flask")
-                if "sqlalchemy" in p_text:
-                    detected_frameworks.append("SQLAlchemy")
-                if "pytest" in p_text:
-                    confirmed_facts.append("Test framework: Pytest")
+            for m_path, m_content in manifests_summary.items():
+                if m_path.endswith(py_man):
+                    p_text = m_content.lower()
+                    if "fastapi" in p_text and "FastAPI" not in detected_frameworks:
+                        detected_frameworks.append("FastAPI")
+                    if "django" in p_text and "Django" not in detected_frameworks:
+                        detected_frameworks.append("Django")
+                    if "flask" in p_text and "Flask" not in detected_frameworks:
+                        detected_frameworks.append("Flask")
+                    if "sqlalchemy" in p_text and "SQLAlchemy" not in detected_frameworks:
+                        detected_frameworks.append("SQLAlchemy")
+                    if ("pymongo" in p_text or "motor" in p_text) and "MongoDB" not in detected_frameworks:
+                        detected_frameworks.append("MongoDB")
+                    if "pytest" in p_text:
+                        confirmed_facts.append("Test framework: Pytest")
 
         # Scan entry points
         common_entrypoints = [
+            "backend/src/server.js", "backend/src/app.js", "backend/server.js", "backend/index.js",
+            "server.js", "app.js", "src/server.js", "src/app.js", "src/index.js", "index.js",
+            "frontend/src/main.jsx", "frontend/src/App.jsx", "frontend/src/index.js",
+            "src/main.jsx", "src/App.jsx", "src/index.tsx", "src/main.tsx", "src/app/page.tsx",
             "main.py", "app/main.py", "src/main.py", "app.py",
-            "index.ts", "src/index.ts", "src/app/page.tsx", "server.js",
-            "src/main.rs", "main.go"
+            "index.ts", "src/index.ts", "src/main.rs", "main.go"
         ]
         for ep in common_entrypoints:
-            if ep in blob_paths:
+            if ep in blob_paths and ep not in detected_entrypoints:
                 detected_entrypoints.append(ep)
+
+        # Domain directory discovery for confirmed architectural facts
+        models_found = [p for p in blob_paths if "/models/" in p or p.startswith("models/")]
+        controllers_found = [p for p in blob_paths if "/controllers/" in p or p.startswith("controllers/")]
+        routes_found = [p for p in blob_paths if "/routes/" in p or p.startswith("routes/")]
+        pages_found = [p for p in blob_paths if "/pages/" in p or p.startswith("pages/")]
+
+        if models_found:
+            confirmed_facts.append(f"Database models: {', '.join(models_found[:6])}")
+        if controllers_found:
+            confirmed_facts.append(f"API controllers: {', '.join(controllers_found[:6])}")
+        if routes_found:
+            confirmed_facts.append(f"API routes: {', '.join(routes_found[:6])}")
+        if pages_found:
+            confirmed_facts.append(f"Frontend pages: {', '.join(pages_found[:6])}")
 
         if detected_frameworks:
             confirmed_facts.append(f"Detected frameworks: {', '.join(detected_frameworks)}")
@@ -158,11 +211,16 @@ class InspectionService:
             "Production runtime metrics and external service configurations",
         ]
 
+        # Ensure key_paths includes architectural components and not just the first 50 alphabetically
+        highlight_paths = list(dict.fromkeys(
+            detected_entrypoints + models_found + controllers_found + routes_found + pages_found + blob_paths[:40]
+        ))
+
         return {
             "tree_summary": {
                 "total_files": total_files,
                 "manifest_count": len(manifests_found),
-                "key_paths": blob_paths[:50],  # Sample representative paths
+                "key_paths": highlight_paths[:60],
             },
             "detected_languages": detected_languages,
             "detected_frameworks": list(set(detected_frameworks)),
