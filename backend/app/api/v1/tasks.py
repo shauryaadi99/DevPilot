@@ -1,12 +1,11 @@
 """Tasks API router.
 
 Handles requirement submission, repository inspection, Product Analyst analysis,
-Architect planning, and persistent human approval workflows.
-Includes closed-loop re-planning when changes are requested by human review.
+Architect planning, persistent human approval workflows, and Chapter 3 autonomous execution.
 """
 
 from typing import Any, Dict, List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Header
+from fastapi import APIRouter, Depends, HTTPException, Header, BackgroundTasks
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -18,6 +17,7 @@ from app.db.models import (
     RequirementAnalysis,
     ImplementationPlan,
     PlanApproval,
+    TaskExecution,
 )
 from app.integrations.github_client import GitHubClient, GitHubError
 from app.services.inspection_service import InspectionService
@@ -401,4 +401,186 @@ async def record_plan_approval(
             "decided_at": approval.decided_at.isoformat(),
         },
         "task": get_task(task_id=task.id, db=db),
+    }
+
+
+
+# ── Chapter 3: Autonomous Execution Endpoints ──────────────────────────────
+
+from app.services.execution_service import ExecutionService
+
+
+class ExecuteRequest(BaseModel):
+    github_token: Optional[str] = None  # PAT for private repos; never stored
+
+
+@router.post("/{task_id}/execute", summary="Execute Approved Plan (Chapter 3)")
+async def execute_plan(
+    task_id: str,
+    payload: ExecuteRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """Start autonomous execution of an APPROVED implementation plan.
+
+    Backend enforces:
+    - Task exists with APPROVED status
+    - ImplementationPlan exists
+    - Latest PlanApproval.decision == APPROVED
+    - No execution already running
+    Returns 403 if any check fails.
+    """
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+
+    # Approval gate enforcement (backend, not frontend-only)
+    if task.status not in ("APPROVED",):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Task is not in APPROVED state (current: {task.status}). Cannot execute.",
+        )
+
+    if not task.implementation_plan:
+        raise HTTPException(status_code=403, detail="No implementation plan found for this task.")
+
+    latest_approval = (
+        db.query(PlanApproval)
+        .filter(PlanApproval.task_id == task_id)
+        .order_by(PlanApproval.decided_at.desc())
+        .first()
+    )
+    if not latest_approval or latest_approval.decision != "APPROVED":
+        raise HTTPException(
+            status_code=403,
+            detail="No APPROVED plan approval record found. Human review required.",
+        )
+
+    # Prevent duplicate executions
+    running = (
+        db.query(TaskExecution)
+        .filter(TaskExecution.task_id == task_id, TaskExecution.status.in_(["CLONING", "EXECUTING", "COMMITTING"]))
+        .first()
+    )
+    if running:
+        raise HTTPException(status_code=409, detail=f"Execution {running.id} is already running.")
+
+    # Create execution record
+    execution = TaskExecution(
+        task_id=task.id,
+        status="PENDING",
+        total_steps=len(task.implementation_plan.implementation_steps),
+    )
+    db.add(execution)
+    db.commit()
+    db.refresh(execution)
+
+    # Launch async background execution
+    service = ExecutionService()
+    background_tasks.add_task(
+        service.execute_plan,
+        db=db,
+        task=task,
+        execution=execution,
+        github_token=payload.github_token,
+    )
+
+    return {
+        "status": "started",
+        "execution_id": execution.id,
+        "task_id": task_id,
+        "message": "Execution started in background. Poll GET /{task_id}/execution for status.",
+    }
+
+
+@router.get("/{task_id}/execution", summary="Get Execution Status (Chapter 3)")
+def get_execution_status(task_id: str, db: Session = Depends(get_db)):
+    """Poll execution progress, file changes, and logs for a task."""
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+
+    execution = (
+        db.query(TaskExecution)
+        .filter(TaskExecution.task_id == task_id)
+        .order_by(TaskExecution.started_at.desc())
+        .first()
+    )
+    if not execution:
+        raise HTTPException(status_code=404, detail="No execution found for this task.")
+
+    return {
+        "execution_id": execution.id,
+        "task_id": task_id,
+        "status": execution.status,
+        "branch_name": execution.branch_name,
+        "current_step": execution.current_step,
+        "total_steps": execution.total_steps,
+        "commit_sha": execution.commit_sha,
+        "error_message": execution.error_message,
+        "started_at": execution.started_at.isoformat(),
+        "completed_at": execution.completed_at.isoformat() if execution.completed_at else None,
+        "file_changes": [
+            {
+                "file_path": fc.file_path,
+                "change_type": fc.change_type,
+                "diff_summary": fc.diff_summary,
+                "lines_added": fc.lines_added,
+                "lines_removed": fc.lines_removed,
+            }
+            for fc in execution.file_changes
+        ],
+        "logs": [
+            {
+                "step_number": log.step_number,
+                "level": log.level,
+                "agent": log.agent,
+                "message": log.message,
+                "timestamp": log.timestamp.isoformat(),
+            }
+            for log in execution.logs
+        ],
+    }
+
+
+@router.post("/{task_id}/cancel", summary="Cancel Running Execution (Chapter 3)")
+def cancel_execution(task_id: str, db: Session = Depends(get_db)):
+    """Mark a running execution as CANCELLED. Cleans up workspace."""
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+
+    execution = (
+        db.query(TaskExecution)
+        .filter(TaskExecution.task_id == task_id)
+        .order_by(TaskExecution.started_at.desc())
+        .first()
+    )
+    if not execution:
+        raise HTTPException(status_code=404, detail="No execution found.")
+
+    if execution.status in ("COMPLETED", "FAILED", "CANCELLED"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Execution already in terminal state: {execution.status}",
+        )
+
+    from datetime import datetime, timezone
+    execution.status = "CANCELLED"
+    execution.completed_at = datetime.now(timezone.utc)
+    task.status = "CANCELLED"
+    db.commit()
+
+    # Best-effort workspace cleanup
+    try:
+        from app.services.git_service import cleanup_workspace
+        cleanup_workspace(task_id)
+    except Exception:
+        pass
+
+    return {
+        "status": "cancelled",
+        "execution_id": execution.id,
+        "task_id": task_id,
+        "message": "Execution marked as CANCELLED. Workspace cleaned up.",
     }

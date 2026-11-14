@@ -298,3 +298,82 @@ export async function submitPlanApproval(
   }
   return res.json();
 }
+
+
+// ── Chapter 3: Execution API ───────────────────────────────────────────────
+
+export interface FileChangeData {
+  file_path: string;
+  change_type: "CREATE" | "MODIFY" | "DELETE";
+  diff_summary: string;
+  lines_added: number;
+  lines_removed: number;
+}
+
+export interface ExecutionLogEntry {
+  step_number: number;
+  level: "INFO" | "WARNING" | "ERROR";
+  agent: string;
+  message: string;
+  timestamp: string;
+}
+
+export interface ExecutionStatus {
+  execution_id: string;
+  task_id: string;
+  status: "PENDING" | "CLONING" | "EXECUTING" | "COMMITTING" | "COMPLETED" | "FAILED" | "CANCELLED";
+  branch_name: string | null;
+  current_step: number;
+  total_steps: number;
+  commit_sha: string | null;
+  error_message: string | null;
+  started_at: string;
+  completed_at: string | null;
+  file_changes: FileChangeData[];
+  logs: ExecutionLogEntry[];
+}
+
+export async function executeTask(
+  taskId: string,
+  githubToken?: string,
+): Promise<{ status: string; execution_id: string; task_id: string; message: string }> {
+  const url = `${API_BASE_URL}/api/v1/tasks/${taskId}/execute`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Accept": "application/json" },
+    body: JSON.stringify({ github_token: githubToken || null }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Execution start failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function getExecutionStatus(taskId: string): Promise<ExecutionStatus> {
+  const url = `${API_BASE_URL}/api/v1/tasks/${taskId}/execution`;
+  const res = await fetch(url, {
+    cache: "no-store",
+    headers: { "Accept": "application/json" },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Failed to get execution status: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function cancelExecution(
+  taskId: string,
+): Promise<{ status: string; execution_id: string; task_id: string; message: string }> {
+  const url = `${API_BASE_URL}/api/v1/tasks/${taskId}/cancel`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Accept": "application/json" },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Cancel failed: ${res.status}`);
+  }
+  return res.json();
+}

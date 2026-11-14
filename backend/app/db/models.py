@@ -1,7 +1,8 @@
 """SQLAlchemy ORM models for DevPilot.
 
 Covers repository tracking, tasks, inspection results,
-agent analyses, implementation plans, and human approval decisions.
+agent analyses, implementation plans, human approval decisions,
+and Chapter 3 autonomous execution tracking.
 """
 
 from datetime import datetime, timezone
@@ -61,7 +62,7 @@ class Task(Base):
         String(50),
         default="PENDING",
         index=True,
-    )  # PENDING, INSPECTING, ANALYZING, PLANNING, AWAITING_APPROVAL, APPROVED, REJECTED, CHANGES_REQUESTED
+    )  # PENDING, INSPECTING, ANALYZING, PLANNING, AWAITING_APPROVAL, APPROVED, REJECTED, CHANGES_REQUESTED, EXECUTING, COMPLETED, FAILED, CANCELLED
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -71,6 +72,7 @@ class Task(Base):
     requirement_analysis: Mapped[Optional["RequirementAnalysis"]] = relationship("RequirementAnalysis", back_populates="task", uselist=False, cascade="all, delete-orphan")
     implementation_plan: Mapped[Optional["ImplementationPlan"]] = relationship("ImplementationPlan", back_populates="task", uselist=False, cascade="all, delete-orphan")
     approvals: Mapped[List["PlanApproval"]] = relationship("PlanApproval", back_populates="task", cascade="all, delete-orphan")
+    executions: Mapped[List["TaskExecution"]] = relationship("TaskExecution", back_populates="task", cascade="all, delete-orphan")
 
 
 class InspectionResult(Base):
@@ -153,4 +155,67 @@ class PlanApproval(Base):
     # Relationships
     task: Mapped["Task"] = relationship("Task", back_populates="approvals")
     plan: Mapped["ImplementationPlan"] = relationship("ImplementationPlan", back_populates="approvals")
+
+
+# ── Chapter 3: Autonomous Execution Models ─────────────────────────────────
+
+
+class TaskExecution(Base):
+    """Tracks a single autonomous execution run of an approved plan."""
+
+    __tablename__ = "task_executions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    task_id: Mapped[str] = mapped_column(String(36), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(
+        String(50), default="PENDING", index=True
+    )  # PENDING, CLONING, EXECUTING, COMMITTING, COMPLETED, FAILED, CANCELLED
+    branch_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    workspace_path: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
+    current_step: Mapped[int] = mapped_column(Integer, default=0)
+    total_steps: Mapped[int] = mapped_column(Integer, default=0)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    commit_sha: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Relationships
+    task: Mapped["Task"] = relationship("Task", back_populates="executions")
+    file_changes: Mapped[List["FileChange"]] = relationship("FileChange", back_populates="execution", cascade="all, delete-orphan")
+    logs: Mapped[List["ExecutionLog"]] = relationship("ExecutionLog", back_populates="execution", cascade="all, delete-orphan", order_by="ExecutionLog.step_number")
+
+
+class FileChange(Base):
+    """Records a single file operation performed during task execution."""
+
+    __tablename__ = "file_changes"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    execution_id: Mapped[str] = mapped_column(String(36), ForeignKey("task_executions.id", ondelete="CASCADE"), nullable=False, index=True)
+    file_path: Mapped[str] = mapped_column(String(1000), nullable=False)
+    change_type: Mapped[str] = mapped_column(String(20), nullable=False)  # CREATE, MODIFY, DELETE
+    diff_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    lines_added: Mapped[int] = mapped_column(Integer, default=0)
+    lines_removed: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    # Relationship
+    execution: Mapped["TaskExecution"] = relationship("TaskExecution", back_populates="file_changes")
+
+
+class ExecutionLog(Base):
+    """Append-only log of Developer Agent actions during execution."""
+
+    __tablename__ = "execution_logs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    execution_id: Mapped[str] = mapped_column(String(36), ForeignKey("task_executions.id", ondelete="CASCADE"), nullable=False, index=True)
+    step_number: Mapped[int] = mapped_column(Integer, default=0)
+    level: Mapped[str] = mapped_column(String(20), default="INFO")  # INFO, WARNING, ERROR
+    agent: Mapped[str] = mapped_column(String(100), default="DeveloperAgent")
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    # Relationship
+    execution: Mapped["TaskExecution"] = relationship("TaskExecution", back_populates="logs")
 

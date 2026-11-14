@@ -13,11 +13,15 @@ import {
   createTask,
   runTaskPipeline,
   submitPlanApproval,
+  executeTask,
+  getExecutionStatus,
+  cancelExecution,
   type HealthResponse,
   type GroqTestResult,
   type GitHubUser,
   type GitHubRepo,
   type TaskDetail,
+  type ExecutionStatus,
 } from "@/lib/api";
 import {
   Database,
@@ -43,6 +47,11 @@ import {
   FileEdit,
   Sparkles,
   ChevronRight,
+  Terminal,
+  GitBranch,
+  ShieldCheck,
+  Layers,
+  FileCode,
 } from "@/components/ui/Icons";
 
 export default function WorkspacePage() {
@@ -80,6 +89,12 @@ export default function WorkspacePage() {
   const [submittingApproval, setSubmittingApproval] = useState<boolean>(false);
   const [approvalAction, setApprovalAction] = useState<string | null>(null);
   const [planRevisionMessage, setPlanRevisionMessage] = useState<string | null>(null);
+
+  // Chapter 3: Execution State
+  const [executionStatus, setExecutionStatus] = useState<ExecutionStatus | null>(null);
+  const [executingPlan, setExecutingPlan] = useState<boolean>(false);
+  const [executionError, setExecutionError] = useState<string | null>(null);
+  const [pollingExecution, setPollingExecution] = useState<boolean>(false);
 
   const loadHealthData = async () => {
     try {
@@ -225,7 +240,7 @@ export default function WorkspacePage() {
         );
       } else if (decision === "APPROVED") {
         setPlanRevisionMessage(
-          result.message || "Plan approved! Chapter 2 review complete. No autonomous code modification permitted in this chapter."
+          result.message || "Plan approved! Ready for autonomous execution in Chapter 3."
         );
       }
 
@@ -235,6 +250,59 @@ export default function WorkspacePage() {
     } finally {
       setSubmittingApproval(false);
       setApprovalAction(null);
+    }
+  };
+
+  // ── Chapter 3: Execute plan handler ──────────────────────────────────────
+  const handleExecutePlan = async () => {
+    if (!currentTask) return;
+    try {
+      setExecutingPlan(true);
+      setExecutionError(null);
+      setExecutionStatus(null);
+      await executeTask(currentTask.id, githubToken || undefined);
+      // Start polling
+      setPollingExecution(true);
+      pollExecutionStatus(currentTask.id);
+    } catch (err: any) {
+      setExecutionError(err?.message || "Failed to start execution.");
+      setExecutingPlan(false);
+    }
+  };
+
+  const pollExecutionStatus = async (taskId: string) => {
+    const TERMINAL = ["COMPLETED", "FAILED", "CANCELLED"];
+    let attempts = 0;
+    const MAX_ATTEMPTS = 120; // 10 min at 5s intervals
+    const poll = async () => {
+      try {
+        const status = await getExecutionStatus(taskId);
+        setExecutionStatus(status);
+        if (TERMINAL.includes(status.status) || attempts >= MAX_ATTEMPTS) {
+          setPollingExecution(false);
+          setExecutingPlan(false);
+        } else {
+          attempts++;
+          setTimeout(poll, 5000);
+        }
+      } catch {
+        setPollingExecution(false);
+        setExecutingPlan(false);
+      }
+    };
+    poll();
+  };
+
+  const handleCancelExecution = async () => {
+    if (!currentTask) return;
+    try {
+      await cancelExecution(currentTask.id);
+      const status = await getExecutionStatus(currentTask.id);
+      setExecutionStatus(status);
+      setPollingExecution(false);
+      setExecutingPlan(false);
+    } catch (err: any) {
+      setExecutionError(err?.message || "Cancel failed.");
     }
   };
 
@@ -547,7 +615,13 @@ export default function WorkspacePage() {
                       <ChevronRight className="w-3.5 h-3.5" />
                       <span>3. Architect Plan</span>
                       <ChevronRight className="w-3.5 h-3.5" />
-                      <span className="text-blue-400 font-semibold">4. Human Review</span>
+                      <span className={currentTask.status === "APPROVED" ? "text-green-400 font-semibold" : "text-blue-400 font-semibold"}>4. Human Review</span>
+                      {currentTask.status === "APPROVED" && (
+                        <>
+                          <ChevronRight className="w-3.5 h-3.5" />
+                          <span className={["EXECUTING","COMPLETED","COMMITTING"].includes(executionStatus?.status || "") ? "text-purple-400 font-semibold" : "text-gray-500"}>5. Dev Agent</span>
+                        </>
+                      )}
                     </div>
                   </div>
 
@@ -828,6 +902,220 @@ export default function WorkspacePage() {
                           </div>
                         )}
                       </div>
+                    </div>
+                  )}
+
+                  {/* Chapter 3 — Autonomous Development Engine Card */}
+                  {(currentTask.status === "APPROVED" ||
+                    ["CLONING", "EXECUTING", "COMMITTING", "COMPLETED", "FAILED", "CANCELLED"].includes(currentTask.status) ||
+                    executionStatus !== null) && (
+                    <div className="p-5 rounded-xl bg-gray-900/60 border border-purple-900/40 space-y-4 shadow-xl shadow-purple-950/10">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-3 border-b border-gray-800 gap-3">
+                        <div className="flex items-center gap-2.5">
+                          <div className="p-2 rounded-lg bg-purple-950/60 border border-purple-800/60 text-purple-400">
+                            <Terminal className="w-5 h-5" />
+                          </div>
+                          <div>
+                            <div className="flex items-center gap-2">
+                              <h4 className="text-sm font-semibold text-white">Chapter 3 — Autonomous Development Engine</h4>
+                              <StatusBadge
+                                status={executionStatus?.status || (currentTask.status === "APPROVED" ? "READY" : currentTask.status)}
+                              />
+                            </div>
+                            <p className="text-xs text-gray-400 mt-0.5">
+                              Developer Agent executes approved plan steps in an isolated Git workspace.
+                            </p>
+                          </div>
+                        </div>
+
+                        {/* Git Branch Badge */}
+                        <div className="flex items-center gap-2">
+                          <span className="flex items-center gap-1.5 px-3 py-1 rounded-md bg-gray-950 border border-gray-800 text-[11px] font-mono text-purple-300">
+                            <GitBranch className="w-3.5 h-3.5 text-purple-400" />
+                            devpilot/task-{currentTask.id.slice(0, 8)}
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Security & Sandbox Info */}
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+                        <div className="p-3 rounded-lg bg-gray-950/60 border border-gray-800/80 flex items-center gap-2.5">
+                          <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+                          <div>
+                            <div className="font-semibold text-emerald-300 text-[11px]">Branch Isolation Active</div>
+                            <div className="text-[10px] text-gray-400">Default branch ({currentTask.repository.default_branch}) strictly protected. Changes confined to task branch.</div>
+                          </div>
+                        </div>
+
+                        <div className="p-3 rounded-lg bg-gray-950/60 border border-gray-800/80 flex items-center gap-2.5">
+                          <Layers className="w-4 h-4 text-blue-400 shrink-0" />
+                          <div>
+                            <div className="font-semibold text-blue-300 text-[11px]">Restricted Execution Sandbox</div>
+                            <div className="text-[10px] text-gray-400">Path traversal blocked • 512MB RAM cap • 60s timeout • Stripped secrets.</div>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Action & Trigger Controls */}
+                      <div className="p-4 rounded-xl bg-gray-950/80 border border-gray-800 flex flex-col sm:flex-row items-center justify-between gap-3">
+                        <div className="text-xs">
+                          {executingPlan || ["CLONING", "EXECUTING", "COMMITTING"].includes(executionStatus?.status || "") ? (
+                            <div className="flex items-center gap-2 text-purple-300">
+                              <RefreshCw className="w-4 h-4 animate-spin text-purple-400" />
+                              <span className="font-semibold">Developer Agent Running:</span>
+                              <span className="text-gray-400">
+                                Step {executionStatus?.current_step || 0} of {executionStatus?.total_steps || currentTask.implementation_plan?.implementation_steps.length || 0}
+                              </span>
+                            </div>
+                          ) : executionStatus?.status === "COMPLETED" ? (
+                            <div className="flex items-center gap-2 text-emerald-400 font-semibold">
+                              <CheckCircle className="w-4 h-4" />
+                              Plan Implemented & Committed Successfully!
+                              {executionStatus.commit_sha && (
+                                <span className="ml-2 px-2 py-0.5 rounded bg-emerald-950/80 border border-emerald-800/60 text-emerald-200 font-mono text-[10px]">
+                                  {executionStatus.commit_sha.slice(0, 7)}
+                                </span>
+                              )}
+                            </div>
+                          ) : executionStatus?.status === "FAILED" ? (
+                            <div className="flex items-center gap-2 text-rose-400 font-semibold">
+                              <AlertTriangle className="w-4 h-4" />
+                              Execution Encountered an Error: {executionStatus.error_message}
+                            </div>
+                          ) : executionStatus?.status === "CANCELLED" ? (
+                            <div className="flex items-center gap-2 text-amber-400 font-semibold">
+                              <AlertTriangle className="w-4 h-4" />
+                              Execution was cancelled. Workspace cleaned up.
+                            </div>
+                          ) : (
+                            <div>
+                              <div className="font-semibold text-white">Ready for Autonomous Execution</div>
+                              <p className="text-gray-400 text-[11px] mt-0.5">
+                                Plan approved. Click to launch the Developer Agent inside the sandboxed workspace.
+                              </p>
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="flex items-center gap-2 shrink-0">
+                          {executingPlan || ["CLONING", "EXECUTING", "COMMITTING"].includes(executionStatus?.status || "") ? (
+                            <button
+                              onClick={handleCancelExecution}
+                              className="px-4 py-2 rounded-lg bg-rose-700 hover:bg-rose-600 text-xs font-semibold text-white transition-colors flex items-center gap-1.5"
+                            >
+                              <X className="w-3.5 h-3.5" />
+                              Cancel Execution
+                            </button>
+                          ) : (
+                            <button
+                              onClick={handleExecutePlan}
+                              disabled={executingPlan}
+                              className="px-5 py-2.5 rounded-lg bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-xs font-semibold text-white transition-all shadow-lg shadow-purple-950/40 flex items-center gap-2 disabled:opacity-50"
+                            >
+                              <Sparkles className="w-4 h-4" />
+                              {executionStatus?.status === "FAILED" || executionStatus?.status === "CANCELLED"
+                                ? "Retry Execution"
+                                : "Execute Approved Plan"}
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Execution Error Banner */}
+                      {executionError && (
+                        <div className="flex items-start gap-2.5 p-3.5 rounded-lg bg-rose-950/40 border border-rose-800/60 text-rose-200 text-xs">
+                          <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                          <div>
+                            <div className="font-semibold text-rose-300">Execution Error</div>
+                            <p className="text-[11px] text-rose-200/80 mt-0.5">{executionError}</p>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Tracked File Changes */}
+                      {executionStatus?.file_changes && executionStatus.file_changes.length > 0 && (
+                        <div className="p-4 rounded-xl bg-gray-950/60 border border-gray-800 space-y-3">
+                          <div className="flex items-center justify-between border-b border-gray-800 pb-2">
+                            <span className="text-xs font-semibold text-gray-300 uppercase tracking-wider flex items-center gap-1.5">
+                              <FileCode className="w-3.5 h-3.5 text-purple-400" />
+                              Tracked Codebase Modifications ({executionStatus.file_changes.length})
+                            </span>
+                          </div>
+
+                          <div className="space-y-2">
+                            {executionStatus.file_changes.map((fc, idx) => (
+                              <div
+                                key={idx}
+                                className="flex items-center justify-between p-2.5 rounded-lg bg-gray-900/60 border border-gray-800/80 text-xs font-mono"
+                              >
+                                <div className="flex items-center gap-2.5">
+                                  <span
+                                    className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${
+                                      fc.change_type === "CREATE"
+                                        ? "bg-emerald-950 text-emerald-400 border border-emerald-800/60"
+                                        : fc.change_type === "MODIFY"
+                                        ? "bg-blue-950 text-blue-400 border border-blue-800/60"
+                                        : "bg-rose-950 text-rose-400 border border-rose-800/60"
+                                    }`}
+                                  >
+                                    {fc.change_type}
+                                  </span>
+                                  <span className="text-gray-200">{fc.file_path}</span>
+                                </div>
+
+                                <div className="flex items-center gap-3 text-[11px]">
+                                  {fc.lines_added > 0 && (
+                                    <span className="text-emerald-400">+{fc.lines_added}</span>
+                                  )}
+                                  {fc.lines_removed > 0 && (
+                                    <span className="text-rose-400">-{fc.lines_removed}</span>
+                                  )}
+                                  {fc.diff_summary && (
+                                    <span className="text-gray-500">{fc.diff_summary}</span>
+                                  )}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Developer Agent Execution Logs Terminal */}
+                      {executionStatus?.logs && executionStatus.logs.length > 0 && (
+                        <div className="p-4 rounded-xl bg-gray-950 border border-gray-800 space-y-2">
+                          <div className="flex items-center justify-between pb-2 border-b border-gray-800/80">
+                            <span className="text-xs font-semibold text-gray-400 uppercase tracking-wider flex items-center gap-1.5">
+                              <Terminal className="w-3.5 h-3.5 text-gray-400" />
+                              Execution Audit Trail & Logs
+                            </span>
+                            <span className="text-[10px] font-mono text-gray-500">
+                              {executionStatus.logs.length} entries
+                            </span>
+                          </div>
+
+                          <div className="max-h-48 overflow-y-auto space-y-1 font-mono text-[11px] text-gray-300 pt-1">
+                            {executionStatus.logs.map((log, idx) => (
+                              <div key={idx} className="flex items-start gap-2 py-0.5">
+                                <span className="text-gray-600 shrink-0">
+                                  {new Date(log.timestamp).toLocaleTimeString()}
+                                </span>
+                                <span
+                                  className={`shrink-0 font-semibold ${
+                                    log.level === "ERROR"
+                                      ? "text-rose-400"
+                                      : log.level === "WARNING"
+                                      ? "text-amber-400"
+                                      : "text-purple-400"
+                                  }`}
+                                >
+                                  [{log.agent}]
+                                </span>
+                                <span className="text-gray-300 break-all">{log.message}</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>

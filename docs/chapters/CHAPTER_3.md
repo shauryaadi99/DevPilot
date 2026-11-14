@@ -2,7 +2,7 @@
 
 **Project:** DevPilot  
 **Chapter:** 3 of 5  
-**Status:** NOT STARTED  
+**Status:** COMPLETED  
 **Depends on:** Chapters 1 and 2
 
 ---
@@ -198,19 +198,19 @@ These belong to later chapters.
 
 ## 7. ACCEPTANCE CRITERIA
 
-- [ ] Approved plans can be executed.
-- [ ] Unapproved plans are rejected by the backend.
-- [ ] Task-specific Git branches are created.
-- [ ] Main branch remains untouched.
-- [ ] Developer Agent can read repository files.
-- [ ] Developer Agent can create and edit files.
-- [ ] Filesystem access is restricted.
-- [ ] Changes are tracked.
-- [ ] Execution is isolated.
-- [ ] Timeouts and resource limits work.
-- [ ] Failures are reported accurately.
-- [ ] Task cancellation is handled safely.
-- [ ] Tests verify branch isolation and workspace security.
+- [x] Approved plans can be executed.
+- [x] Unapproved plans are rejected by the backend.
+- [x] Task-specific Git branches are created.
+- [x] Main branch remains untouched.
+- [x] Developer Agent can read repository files.
+- [x] Developer Agent can create and edit files.
+- [x] Filesystem access is restricted.
+- [x] Changes are tracked.
+- [x] Execution is isolated.
+- [x] Timeouts and resource limits work.
+- [x] Failures are reported accurately.
+- [x] Task cancellation is handled safely.
+- [x] Tests verify branch isolation and workspace security.
 
 ## 8. REQUIRED FINAL REPORT
 
