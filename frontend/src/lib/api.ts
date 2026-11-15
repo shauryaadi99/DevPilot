@@ -321,7 +321,7 @@ export interface ExecutionLogEntry {
 export interface ExecutionStatus {
   execution_id: string;
   task_id: string;
-  status: "PENDING" | "CLONING" | "EXECUTING" | "COMMITTING" | "COMPLETED" | "FAILED" | "CANCELLED";
+  status: "PENDING" | "CLONING" | "EXECUTING" | "COMMITTING" | "AWAITING_QA" | "AWAITING_REVIEW" | "AWAITING_DELIVERY" | "COMPLETED" | "FAILED" | "CANCELLED" | "CLOSED";
   branch_name: string | null;
   current_step: number;
   total_steps: number;
@@ -374,6 +374,21 @@ export async function cancelExecution(
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error(err.detail || `Cancel failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function closeTask(
+  taskId: string,
+): Promise<{ status: string; task_id: string; workspace_removed: boolean; message: string }> {
+  const url = `${API_BASE_URL}/api/v1/tasks/${taskId}/close`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Accept": "application/json" },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Close task failed: ${res.status}`);
   }
   return res.json();
 }

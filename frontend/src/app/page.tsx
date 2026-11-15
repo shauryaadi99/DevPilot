@@ -16,6 +16,7 @@ import {
   executeTask,
   getExecutionStatus,
   cancelExecution,
+  closeTask,
   type HealthResponse,
   type GroqTestResult,
   type GitHubUser,
@@ -271,7 +272,7 @@ export default function WorkspacePage() {
   };
 
   const pollExecutionStatus = async (taskId: string) => {
-    const TERMINAL = ["COMPLETED", "FAILED", "CANCELLED"];
+    const TERMINAL = ["AWAITING_QA", "AWAITING_REVIEW", "AWAITING_DELIVERY", "COMPLETED", "FAILED", "CANCELLED", "CLOSED"];
     let attempts = 0;
     const MAX_ATTEMPTS = 120; // 10 min at 5s intervals
     const poll = async () => {
@@ -619,7 +620,7 @@ export default function WorkspacePage() {
                       {currentTask.status === "APPROVED" && (
                         <>
                           <ChevronRight className="w-3.5 h-3.5" />
-                          <span className={["EXECUTING","COMPLETED","COMMITTING"].includes(executionStatus?.status || "") ? "text-purple-400 font-semibold" : "text-gray-500"}>5. Dev Agent</span>
+                          <span className={["EXECUTING","COMMITTING","AWAITING_QA","AWAITING_REVIEW","AWAITING_DELIVERY","CLOSED"].includes(executionStatus?.status || "") ? "text-purple-400 font-semibold" : "text-gray-500"}>5. Dev Agent</span>
                         </>
                       )}
                     </div>
@@ -907,7 +908,7 @@ export default function WorkspacePage() {
 
                   {/* Chapter 3 — Autonomous Development Engine Card */}
                   {(currentTask.status === "APPROVED" ||
-                    ["CLONING", "EXECUTING", "COMMITTING", "COMPLETED", "FAILED", "CANCELLED"].includes(currentTask.status) ||
+                    ["CLONING", "EXECUTING", "COMMITTING", "AWAITING_QA", "AWAITING_REVIEW", "AWAITING_DELIVERY", "COMPLETED", "FAILED", "CANCELLED", "CLOSED"].includes(currentTask.status) ||
                     executionStatus !== null) && (
                     <div className="p-5 rounded-xl bg-gray-900/60 border border-purple-900/40 space-y-4 shadow-xl shadow-purple-950/10">
                       <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-3 border-b border-gray-800 gap-3">
@@ -967,11 +968,11 @@ export default function WorkspacePage() {
                                 Step {executionStatus?.current_step || 0} of {executionStatus?.total_steps || currentTask.implementation_plan?.implementation_steps.length || 0}
                               </span>
                             </div>
-                          ) : executionStatus?.status === "COMPLETED" ? (
+                          ) : ["AWAITING_QA", "AWAITING_REVIEW", "AWAITING_DELIVERY", "COMPLETED"].includes(executionStatus?.status || "") ? (
                             <div className="flex items-center gap-2 text-emerald-400 font-semibold">
                               <CheckCircle className="w-4 h-4" />
-                              Plan Implemented & Committed Successfully!
-                              {executionStatus.commit_sha && (
+                              Implementation Complete — Awaiting QA Review
+                              {executionStatus?.commit_sha && (
                                 <span className="ml-2 px-2 py-0.5 rounded bg-emerald-950/80 border border-emerald-800/60 text-emerald-200 font-mono text-[10px]">
                                   {executionStatus.commit_sha.slice(0, 7)}
                                 </span>
@@ -1007,16 +1008,28 @@ export default function WorkspacePage() {
                               Cancel Execution
                             </button>
                           ) : (
-                            <button
-                              onClick={handleExecutePlan}
-                              disabled={executingPlan}
-                              className="px-5 py-2.5 rounded-lg bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-xs font-semibold text-white transition-all shadow-lg shadow-purple-950/40 flex items-center gap-2 disabled:opacity-50"
-                            >
-                              <Sparkles className="w-4 h-4" />
-                              {executionStatus?.status === "FAILED" || executionStatus?.status === "CANCELLED"
-                                ? "Retry Execution"
-                                : "Execute Approved Plan"}
-                            </button>
+                            <>
+                              <button
+                                onClick={handleExecutePlan}
+                                disabled={executingPlan || ["AWAITING_QA","AWAITING_REVIEW","AWAITING_DELIVERY","CLOSED"].includes(executionStatus?.status || "")}
+                                className="px-5 py-2.5 rounded-lg bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-xs font-semibold text-white transition-all shadow-lg shadow-purple-950/40 flex items-center gap-2 disabled:opacity-40"
+                              >
+                                <Sparkles className="w-4 h-4" />
+                                {executionStatus?.status === "FAILED" || executionStatus?.status === "CANCELLED"
+                                  ? "Retry Execution"
+                                  : "Execute Approved Plan"}
+                              </button>
+                              {["AWAITING_QA", "AWAITING_REVIEW", "AWAITING_DELIVERY", "FAILED", "CANCELLED"].includes(executionStatus?.status || currentTask.status) && (
+                                <button
+                                  onClick={async () => {
+                                    try { await closeTask(currentTask.id); } catch (e: any) { alert(e.message); }
+                                  }}
+                                  className="px-4 py-2 rounded-lg bg-gray-700 hover:bg-gray-600 text-xs font-semibold text-gray-200 transition-colors flex items-center gap-1.5"
+                                >
+                                  Close Task
+                                </button>
+                              )}
+                            </>
                           )}
                         </div>
                       </div>

@@ -35,6 +35,10 @@ class Settings(BaseSettings):
             return [i.strip() for i in v.split(",") if i.strip()]
         return v
 
+    # Workspace settings
+    WORKSPACE_ROOT: str = "./workspaces"
+    WORKSPACE_RETENTION_HOURS: int = 72
+
     # Database settings
     DATABASE_URL: str = "sqlite:///./devpilot.db"
 

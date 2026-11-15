@@ -50,6 +50,9 @@ out/
 *.db
 *.sqlite3
 
+# DevPilot persistent task workspaces
+workspaces/
+
 # IDE / System
 .DS_Store
 Thumbs.db

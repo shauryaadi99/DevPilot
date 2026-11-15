@@ -559,7 +559,7 @@ def cancel_execution(task_id: str, db: Session = Depends(get_db)):
     if not execution:
         raise HTTPException(status_code=404, detail="No execution found.")
 
-    if execution.status in ("COMPLETED", "FAILED", "CANCELLED"):
+    if execution.status in ("COMPLETED", "FAILED", "CANCELLED", "AWAITING_QA", "AWAITING_REVIEW", "AWAITING_DELIVERY", "CLOSED"):
         raise HTTPException(
             status_code=409,
             detail=f"Execution already in terminal state: {execution.status}",
@@ -573,8 +573,8 @@ def cancel_execution(task_id: str, db: Session = Depends(get_db)):
 
     # Best-effort workspace cleanup
     try:
-        from app.services.git_service import cleanup_workspace
-        cleanup_workspace(task_id)
+        from app.services.git_service import cleanup_task_workspace
+        cleanup_task_workspace(task_id)
     except Exception:
         pass
 
@@ -583,4 +583,47 @@ def cancel_execution(task_id: str, db: Session = Depends(get_db)):
         "execution_id": execution.id,
         "task_id": task_id,
         "message": "Execution marked as CANCELLED. Workspace cleaned up.",
+    }
+
+
+@router.post("/{task_id}/close", summary="Explicitly Close a Task and Release Workspace (Chapter 3+)")
+def close_task(task_id: str, db: Session = Depends(get_db)):
+    """Close a completed or failed task. Triggers safe workspace cleanup.
+
+    Valid from: AWAITING_QA, AWAITING_REVIEW, AWAITING_DELIVERY, FAILED, CANCELLED.
+    Sets task status to CLOSED and removes the persistent workspace directory.
+    """
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+
+    closeable_statuses = {
+        "AWAITING_QA", "AWAITING_REVIEW", "AWAITING_DELIVERY", "FAILED", "CANCELLED",
+    }
+    if task.status not in closeable_statuses:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Task cannot be closed from status '{task.status}'. "
+                   f"Closeable from: {sorted(closeable_statuses)}",
+        )
+
+    task.status = "CLOSED"
+    db.commit()
+
+    removed = False
+    try:
+        from app.services.git_service import cleanup_task_workspace
+        cleanup_task_workspace(task_id)
+        removed = True
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.warning(f"[{task_id}] Workspace cleanup failed (non-fatal): {exc}")
+
+    return {
+        "status": "closed",
+        "task_id": task_id,
+        "workspace_removed": removed,
+        "message": "Task closed. Workspace has been released." if removed
+                   else "Task closed. Workspace removal failed — check logs.",
     }

@@ -22,10 +22,9 @@ from app.agents.schemas import ArchitectPlanOutput, FileToCreate, FileToModify, 
 from app.core.logging import logger
 from app.db.models import FileChange, ExecutionLog, Task, TaskExecution
 from app.services.git_service import (
-    clone_repository,
+    prepare_task_workspace,
     create_task_branch,
     stage_and_commit,
-    cleanup_workspace,
     get_workspace_path,
 )
 
@@ -49,7 +48,7 @@ class ExecutionState(TypedDict):
     branch_name: Optional[str]
     developer_result: Optional[Dict[str, Any]]
     commit_sha: Optional[str]
-    status: str  # VALIDATING, CLONING, EXECUTING, COMMITTING, COMPLETED, FAILED, CANCELLED
+    status: str  # VALIDATING, CLONING, EXECUTING, COMMITTING, AWAITING_QA, FAILED, CANCELLED
     error_message: Optional[str]
 
 
@@ -64,23 +63,20 @@ def node_validate(state: ExecutionState) -> ExecutionState:
 
 
 async def node_clone(state: ExecutionState) -> ExecutionState:
-    """Clone repository into isolated workspace and create task branch."""
+    """Prepare persistent workspace (idempotent clone) and ensure task branch."""
     task_id = state["task_id"]
-    logger.info(f"[{task_id}] Cloning repository")
+    logger.info(f"[{task_id}] Preparing workspace")
     try:
         workspace = await asyncio.get_event_loop().run_in_executor(
             None,
-            lambda: clone_repository(
+            lambda: prepare_task_workspace(
                 clone_url=state["repo_clone_url"],
                 task_id=task_id,
                 github_token=state.get("github_token"),
                 default_branch=state["default_branch"],
             )
         )
-        branch_name = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: create_task_branch(workspace, task_id)
-        )
+        branch_name = f"devpilot/task-{task_id}"
         return {**state, "workspace_path": str(workspace), "branch_name": branch_name, "status": "EXECUTING"}
     except RuntimeError as exc:
         return {**state, "status": "FAILED", "error_message": str(exc)}
@@ -150,12 +146,12 @@ async def node_commit(state: ExecutionState) -> ExecutionState:
             None,
             lambda: stage_and_commit(workspace, f"feat(devpilot): implement task {task_id}")
         )
-        return {**state, "status": "COMPLETED", "commit_sha": sha}
+        return {**state, "status": "AWAITING_QA", "commit_sha": sha}
     except RuntimeError as exc:
         # "Nothing to commit" is not fatal — treat as success without commit
         if "Nothing to commit" in str(exc):
             logger.warning(f"[{task_id}] No changes detected after execution.")
-            return {**state, "status": "COMPLETED", "commit_sha": None}
+            return {**state, "status": "AWAITING_QA", "commit_sha": None}
         return {**state, "status": "FAILED", "error_message": str(exc)}
 
 
@@ -189,7 +185,7 @@ def build_execution_graph():
         "FAILED": END,
     })
     graph.add_conditional_edges("COMMITTING", _route, {
-        "COMPLETED": END,
+        "AWAITING_QA": END,
         "FAILED": END,
     })
 
@@ -274,7 +270,7 @@ class ExecutionService:
         execution: TaskExecution,
         state: ExecutionState,
     ) -> None:
-        """Write execution outcomes to DB models."""
+        """Write execution outcomes to DB models. Workspace is NEVER deleted here."""
         status = state["status"]
         execution.status = status
         execution.branch_name = state.get("branch_name")
@@ -284,7 +280,8 @@ class ExecutionService:
         execution.error_message = state.get("error_message")
         execution.completed_at = datetime.now(timezone.utc)
 
-        task.status = status  # COMPLETED, FAILED, CANCELLED
+        # Map internal AWAITING_QA -> task status (FAILED/CANCELLED pass through)
+        task.status = status  # AWAITING_QA, FAILED, CANCELLED
 
         dev_result = state.get("developer_result") or {}
         step_results = dev_result.get("step_results", [])
@@ -303,7 +300,6 @@ class ExecutionService:
             )
             db.add(fc)
 
-            # Persist ExecutionLog for each step
             level = "INFO" if sr["success"] else "ERROR"
             msg = sr.get("explanation") or sr.get("error") or f"Step {sr['step_number']}"
             log = ExecutionLog(
@@ -324,15 +320,12 @@ class ExecutionService:
         db.add(ExecutionLog(
             execution_id=execution.id,
             step_number=len(step_results) + 1,
-            level="INFO" if status == "COMPLETED" else "ERROR",
+            level="INFO" if status == "AWAITING_QA" else "ERROR",
             agent="ExecutionService",
             message=final_msg,
         ))
         db.commit()
-
-        # Cleanup workspace on completion/failure (keep on CANCELLED for inspection)
-        if status in ("COMPLETED", "FAILED") and workspace:
-            cleanup_workspace(task.id)
+        # Workspace is preserved — cleanup only on explicit task closure via POST /close
 
     async def _sequential_fallback(self, state: ExecutionState) -> ExecutionState:
         """Minimal sequential pipeline when LangGraph is not available."""

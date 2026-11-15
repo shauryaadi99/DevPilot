@@ -62,7 +62,7 @@ class Task(Base):
         String(50),
         default="PENDING",
         index=True,
-    )  # PENDING, INSPECTING, ANALYZING, PLANNING, AWAITING_APPROVAL, APPROVED, REJECTED, CHANGES_REQUESTED, EXECUTING, COMPLETED, FAILED, CANCELLED
+    )  # PENDING, INSPECTING, ANALYZING, PLANNING, AWAITING_APPROVAL, APPROVED, REJECTED, CHANGES_REQUESTED, EXECUTING, AWAITING_QA, AWAITING_REVIEW, AWAITING_DELIVERY, CLOSED, FAILED, CANCELLED
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -169,7 +169,7 @@ class TaskExecution(Base):
     task_id: Mapped[str] = mapped_column(String(36), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True)
     status: Mapped[str] = mapped_column(
         String(50), default="PENDING", index=True
-    )  # PENDING, CLONING, EXECUTING, COMMITTING, COMPLETED, FAILED, CANCELLED
+    )  # PENDING, CLONING, EXECUTING, COMMITTING, AWAITING_QA, AWAITING_REVIEW, AWAITING_DELIVERY, CLOSED, FAILED, CANCELLED
     branch_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     workspace_path: Mapped[Optional[str]] = mapped_column(String(1000), nullable=True)
     current_step: Mapped[int] = mapped_column(Integer, default=0)
