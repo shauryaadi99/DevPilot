@@ -812,11 +812,19 @@ export default function WorkspacePage() {
                       <ChevronRight className="w-3.5 h-3.5" />
                       <span>3. Architect Plan</span>
                       <ChevronRight className="w-3.5 h-3.5" />
-                      <span className={currentTask.status === "APPROVED" ? "text-green-400 font-semibold" : "text-blue-400 font-semibold"}>4. Human Review</span>
-                      {currentTask.status === "APPROVED" && (
+                      <span className={(currentTask.is_plan_approved || currentTask.plan_approval_status === "APPROVED" || currentTask.status === "APPROVED") ? "text-green-400 font-semibold" : "text-blue-400 font-semibold"}>4. Human Review</span>
+                      {(currentTask.is_plan_approved || currentTask.plan_approval_status === "APPROVED" || currentTask.status === "APPROVED") && (
                         <>
                           <ChevronRight className="w-3.5 h-3.5" />
-                          <span className={["EXECUTING","COMMITTING","AWAITING_QA","AWAITING_REVIEW","AWAITING_DELIVERY","CLOSED"].includes(executionStatus?.status || "") ? "text-purple-400 font-semibold" : "text-gray-500"}>5. Dev Agent</span>
+                          <span className={
+                            executionStatus?.status === "FAILED" || currentTask.status === "FAILED"
+                              ? "text-rose-400 font-semibold"
+                              : ["EXECUTING","COMMITTING","AWAITING_QA","AWAITING_REVIEW","AWAITING_DELIVERY","CLOSED"].includes(executionStatus?.status || "")
+                              ? "text-purple-400 font-semibold"
+                              : "text-gray-500"
+                          }>
+                            {executionStatus?.status === "FAILED" || currentTask.status === "FAILED" ? "5. Dev Agent (Failed)" : "5. Dev Agent"}
+                          </span>
                         </>
                       )}
                     </div>
@@ -1019,11 +1027,15 @@ export default function WorkspacePage() {
                           <div className="flex items-center gap-2">
                             <button
                               onClick={() => handleApprovalDecision("APPROVED")}
-                              disabled={submittingApproval || currentTask.status === "APPROVED"}
+                              disabled={submittingApproval || Boolean(currentTask.is_plan_approved || currentTask.plan_approval_status === "APPROVED" || currentTask.status === "APPROVED")}
                               className="px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold text-white transition-colors disabled:opacity-50 flex items-center gap-1.5 shadow-md shadow-emerald-900/20"
                             >
                               <Check className="w-3.5 h-3.5" />
-                              {submittingApproval && approvalAction === "APPROVED" ? "Approving..." : "Approve Plan"}
+                              {submittingApproval && approvalAction === "APPROVED"
+                                ? "Approving..."
+                                : (currentTask.is_plan_approved || currentTask.plan_approval_status === "APPROVED" || currentTask.status === "APPROVED")
+                                ? "Plan Approved"
+                                : "Approve Plan"}
                             </button>
 
                             <button
@@ -1103,7 +1115,7 @@ export default function WorkspacePage() {
                   )}
 
                   {/* Chapter 3 — Autonomous Development Engine Card */}
-                  {(currentTask.status === "APPROVED" ||
+                  {((currentTask.is_plan_approved || currentTask.plan_approval_status === "APPROVED" || currentTask.status === "APPROVED") ||
                     ["CLONING", "EXECUTING", "COMMITTING", "AWAITING_QA", "AWAITING_REVIEW", "AWAITING_DELIVERY", "COMPLETED", "FAILED", "CANCELLED", "CLOSED"].includes(currentTask.status) ||
                     executionStatus !== null) && (
                     <div className="p-5 rounded-xl bg-gray-900/60 border border-purple-900/40 space-y-4 shadow-xl shadow-purple-950/10">
@@ -1221,7 +1233,7 @@ export default function WorkspacePage() {
                                 className="px-5 py-2.5 rounded-lg bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-xs font-semibold text-white transition-all shadow-lg shadow-purple-950/40 flex items-center gap-2 disabled:opacity-40"
                               >
                                 <Sparkles className="w-4 h-4" />
-                                {executionStatus?.status === "FAILED" || executionStatus?.status === "CANCELLED"
+                                {executionStatus?.status === "FAILED" || executionStatus?.status === "CANCELLED" || currentTask.status === "FAILED"
                                   ? "Retry Execution"
                                   : "Execute Approved Plan"}
                               </button>

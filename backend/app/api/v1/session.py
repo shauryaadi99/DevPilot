@@ -144,11 +144,21 @@ async def get_session_state(
                 ],
             }
 
+        is_plan_approved = (
+            latest_approval is not None
+            and latest_approval.decision == "APPROVED"
+            and task.implementation_plan is not None
+            and latest_approval.plan_id == task.implementation_plan.id
+        )
+
         task_detail = {
             "id": task.id,
             "title": task.title,
             "requirement": task.user_requirement,
             "status": task.status,
+            "plan_approval_status": latest_approval.decision if latest_approval else "PENDING_REVIEW",
+            "is_plan_approved": is_plan_approved,
+            "execution_status": execution.status if execution else None,
             "created_at": task.created_at.isoformat(),
             "updated_at": task.updated_at.isoformat(),
             "repository": {
@@ -196,6 +206,28 @@ async def get_session_state(
                 "feedback": latest_approval.feedback,
                 "decided_at": latest_approval.decided_at.isoformat(),
             } if latest_approval else None,
+            "approvals": [
+                {
+                    "id": a.id,
+                    "decision": a.decision,
+                    "feedback": a.feedback,
+                    "decided_at": a.decided_at.isoformat(),
+                }
+                for a in task.approvals
+            ],
+            "executions": [
+                {
+                    "id": e.id,
+                    "status": e.status,
+                    "current_step": e.current_step,
+                    "total_steps": e.total_steps,
+                    "commit_sha": e.commit_sha,
+                    "error_message": e.error_message,
+                    "started_at": e.started_at.isoformat(),
+                    "completed_at": e.completed_at.isoformat() if e.completed_at else None,
+                }
+                for e in sorted(task.executions, key=lambda x: x.started_at, reverse=True)
+            ],
         }
 
     return {

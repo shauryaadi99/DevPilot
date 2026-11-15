@@ -163,6 +163,9 @@ export interface TaskDetail {
   title: string;
   requirement: string;
   status: string;
+  plan_approval_status?: string | null;
+  is_plan_approved?: boolean;
+  execution_status?: string | null;
   created_at: string;
   updated_at: string;
   repository: GitHubRepo;
@@ -171,6 +174,7 @@ export interface TaskDetail {
   implementation_plan?: ImplementationPlanData | null;
   latest_approval?: PlanApprovalData | null;
   approvals?: PlanApprovalData[];
+  executions?: any[];
 }
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";

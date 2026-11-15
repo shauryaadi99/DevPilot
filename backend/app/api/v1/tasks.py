@@ -105,16 +105,39 @@ def list_tasks(limit: int = 20, db: Session = Depends(get_db)):
 
 @router.get("/{task_id}", summary="Get Full Task Details")
 def get_task(task_id: str, db: Session = Depends(get_db)):
-    """Retrieve full task context including inspection findings, requirements, plan, and approval."""
+    """Retrieve full task context including inspection findings, requirements, plan, approvals, and executions."""
     task = db.query(Task).filter(Task.id == task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found.")
+
+    latest_approval = (
+        db.query(PlanApproval)
+        .filter(PlanApproval.task_id == task.id)
+        .order_by(PlanApproval.decided_at.desc())
+        .first()
+    )
+    latest_execution = (
+        db.query(TaskExecution)
+        .filter(TaskExecution.task_id == task.id)
+        .order_by(TaskExecution.started_at.desc())
+        .first()
+    )
+
+    is_plan_approved = (
+        latest_approval is not None
+        and latest_approval.decision == "APPROVED"
+        and task.implementation_plan is not None
+        and latest_approval.plan_id == task.implementation_plan.id
+    )
 
     return {
         "id": task.id,
         "title": task.title,
         "requirement": task.user_requirement,
         "status": task.status,
+        "plan_approval_status": latest_approval.decision if latest_approval else "PENDING_REVIEW",
+        "is_plan_approved": is_plan_approved,
+        "execution_status": latest_execution.status if latest_execution else None,
         "created_at": task.created_at.isoformat(),
         "updated_at": task.updated_at.isoformat(),
         "repository": {
@@ -155,6 +178,12 @@ def get_task(task_id: str, db: Session = Depends(get_db)):
             "testing_strategy": task.implementation_plan.testing_strategy,
             "risks_and_assumptions": task.implementation_plan.risks_and_assumptions,
         } if task.implementation_plan else None,
+        "latest_approval": {
+            "id": latest_approval.id,
+            "decision": latest_approval.decision,
+            "feedback": latest_approval.feedback,
+            "decided_at": latest_approval.decided_at.isoformat(),
+        } if latest_approval else None,
         "approvals": [
             {
                 "id": a.id,
@@ -163,6 +192,19 @@ def get_task(task_id: str, db: Session = Depends(get_db)):
                 "decided_at": a.decided_at.isoformat(),
             }
             for a in task.approvals
+        ],
+        "executions": [
+            {
+                "id": e.id,
+                "status": e.status,
+                "current_step": e.current_step,
+                "total_steps": e.total_steps,
+                "commit_sha": e.commit_sha,
+                "error_message": e.error_message,
+                "started_at": e.started_at.isoformat(),
+                "completed_at": e.completed_at.isoformat() if e.completed_at else None,
+            }
+            for e in sorted(task.executions, key=lambda x: x.started_at, reverse=True)
         ],
     }
 
@@ -314,6 +356,21 @@ async def record_plan_approval(
     if not task.implementation_plan:
         raise HTTPException(status_code=400, detail="Cannot review a task without an implementation plan.")
 
+    # Validation: cannot review while execution is actively running or task is closed
+    if task.status == "EXECUTING" or (
+        task.executions and any(e.status in ("CLONING", "EXECUTING", "COMMITTING") for e in task.executions)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot review or approve plan while autonomous execution is actively running.",
+        )
+
+    if task.status == "CLOSED":
+        raise HTTPException(
+            status_code=409,
+            detail="Task is closed. Reopen or create a new task to submit review.",
+        )
+
     # Record persistent approval row
     approval = PlanApproval(
         task_id=task.id,
@@ -451,11 +508,11 @@ async def execute_plan(
     """Start autonomous execution of an APPROVED implementation plan.
 
     Backend enforces:
-    - Task exists with APPROVED status
+    - Task exists and is in APPROVED or FAILED (retry) state
     - ImplementationPlan exists
-    - Latest PlanApproval.decision == APPROVED
-    - No execution already running
-    Returns 403 if any check fails.
+    - Latest PlanApproval.decision == APPROVED for the current plan version
+    - No execution already actively running
+    Returns 403/409 if any validation fails.
     """
     task = db.query(Task).filter(Task.id == task_id).first()
     if not task:
@@ -465,19 +522,15 @@ async def execute_plan(
     if not token and auth_context:
         _, _, decrypted_pat = auth_context
         token = decrypted_pat
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found.")
 
-    # Approval gate enforcement (backend, not frontend-only)
-    if task.status not in ("APPROVED",):
+    # 1. Implementation plan must exist
+    if not task.implementation_plan:
         raise HTTPException(
             status_code=403,
-            detail=f"Task is not in APPROVED state (current: {task.status}). Cannot execute.",
+            detail="No implementation plan found for this task. Formulation of a plan is required before execution.",
         )
 
-    if not task.implementation_plan:
-        raise HTTPException(status_code=403, detail="No implementation plan found for this task.")
-
+    # 2. Plan approval gate check: Human approval MUST be recorded for this plan
     latest_approval = (
         db.query(PlanApproval)
         .filter(PlanApproval.task_id == task_id)
@@ -485,12 +538,50 @@ async def execute_plan(
         .first()
     )
     if not latest_approval or latest_approval.decision != "APPROVED":
+        decision_label = latest_approval.decision if latest_approval else "PENDING_REVIEW"
         raise HTTPException(
             status_code=403,
-            detail="No APPROVED plan approval record found. Human review required.",
+            detail=f"Plan is not in APPROVED state (current approval decision: {decision_label}). Human review required before execution.",
         )
 
-    # Prevent duplicate executions
+    # 3. Ensure the approval is for the CURRENT implementation plan version
+    if latest_approval.plan_id != task.implementation_plan.id:
+        raise HTTPException(
+            status_code=403,
+            detail="Implementation plan has been revised since the last approval. Human review of revised plan required before execution.",
+        )
+
+    # 4. Task lifecycle state check:
+    # A task can enter execution only if it is in APPROVED state (initial execution)
+    # or in FAILED state (retry execution of an approved plan).
+    if task.status not in ("APPROVED", "FAILED"):
+        if task.status in ("PENDING", "INSPECTING", "ANALYZING", "PLANNING", "AWAITING_APPROVAL"):
+            raise HTTPException(
+                status_code=403,
+                detail=f"Task is in {task.status} state. Human approval is required before execution.",
+            )
+        elif task.status in ("REJECTED", "CHANGES_REQUESTED"):
+            raise HTTPException(
+                status_code=403,
+                detail=f"Task plan was {task.status}. Human re-review and approval required before execution.",
+            )
+        elif task.status == "EXECUTING":
+            raise HTTPException(
+                status_code=409,
+                detail="Task is already executing.",
+            )
+        elif task.status in ("AWAITING_QA", "AWAITING_REVIEW", "AWAITING_DELIVERY", "CLOSED"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Task has already completed Chapter 3 execution (status: {task.status}). Cannot re-execute.",
+            )
+        else:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Task cannot be executed from state '{task.status}'.",
+            )
+
+    # 5. Prevent concurrent duplicate executions
     running = (
         db.query(TaskExecution)
         .filter(TaskExecution.task_id == task_id, TaskExecution.status.in_(["CLONING", "EXECUTING", "COMMITTING"]))
@@ -499,7 +590,12 @@ async def execute_plan(
     if running:
         raise HTTPException(status_code=409, detail=f"Execution {running.id} is already running.")
 
-    # Create execution record
+    is_retry = (task.status == "FAILED")
+
+    # 6. Immediately update task lifecycle status
+    task.status = "EXECUTING"
+
+    # 7. Create new execution record (prior execution records and logs are preserved)
     execution = TaskExecution(
         task_id=task.id,
         status="PENDING",
@@ -509,7 +605,7 @@ async def execute_plan(
     db.commit()
     db.refresh(execution)
 
-    # Launch async background execution
+    # 8. Launch async background execution
     service = ExecutionService()
     background_tasks.add_task(
         service.execute_plan,
@@ -523,7 +619,12 @@ async def execute_plan(
         "status": "started",
         "execution_id": execution.id,
         "task_id": task_id,
-        "message": "Execution started in background. Poll GET /{task_id}/execution for status.",
+        "is_retry": is_retry,
+        "message": (
+            "Execution retry started in background. Poll GET /{task_id}/execution for status."
+            if is_retry
+            else "Execution started in background. Poll GET /{task_id}/execution for status."
+        ),
     }
 
 
