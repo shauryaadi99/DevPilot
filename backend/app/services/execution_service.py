@@ -14,7 +14,7 @@ Includes:
 import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, TypedDict
+from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional, Sequence, TypedDict
 import uuid
 
 from sqlalchemy.orm import Session
@@ -33,9 +33,51 @@ from app.services.git_service import (
 
 try:
     from langgraph.graph import StateGraph, END
+    from langgraph.checkpoint.base import BaseCheckpointSaver
     LANGGRAPH_AVAILABLE = True
 except ImportError:
     LANGGRAPH_AVAILABLE = False
+    BaseCheckpointSaver = object
+
+
+class AsyncCompatiblePostgresSaver(BaseCheckpointSaver):
+    """Wraps PostgresSaver to provide async checkpointer methods on all platforms.
+
+    LangGraph async graphs (ainvoke) call async checkpointer methods (aget_tuple, aput).
+    On Windows, psycopg async cannot use ProactorEventLoop; this wrapper executes
+    synchronous PostgreSQL operations in an asyncio worker thread, ensuring seamless
+    PostgreSQL checkpoint persistence across all OS environments and event loops.
+    """
+
+    def __init__(self, sync_saver: Any):
+        super().__init__(serde=sync_saver.serde)
+        self._sync = sync_saver
+
+    def get_tuple(self, config: Dict[str, Any]) -> Optional[Any]:
+        return self._sync.get_tuple(config)
+
+    def list(self, config: Optional[Dict[str, Any]], *, filter: Optional[Dict[str, Any]] = None, before: Optional[Dict[str, Any]] = None, limit: Optional[int] = None) -> Iterator[Any]:
+        return self._sync.list(config, filter=filter, before=before, limit=limit)
+
+    def put(self, config: Dict[str, Any], checkpoint: Any, metadata: Any, new_versions: Any) -> Dict[str, Any]:
+        return self._sync.put(config, checkpoint, metadata, new_versions)
+
+    def put_writes(self, config: Dict[str, Any], writes: Sequence[Any], task_id: str, task_path: str = "") -> None:
+        return self._sync.put_writes(config, writes, task_id, task_path=task_path)
+
+    async def aget_tuple(self, config: Dict[str, Any]) -> Optional[Any]:
+        return await asyncio.to_thread(self.get_tuple, config)
+
+    async def alist(self, config: Optional[Dict[str, Any]], *, filter: Optional[Dict[str, Any]] = None, before: Optional[Dict[str, Any]] = None, limit: Optional[int] = None) -> AsyncIterator[Any]:
+        items = await asyncio.to_thread(lambda: list(self.list(config, filter=filter, before=before, limit=limit)))
+        for item in items:
+            yield item
+
+    async def aput(self, config: Dict[str, Any], checkpoint: Any, metadata: Any, new_versions: Any) -> Dict[str, Any]:
+        return await asyncio.to_thread(self.put, config, checkpoint, metadata, new_versions)
+
+    async def aput_writes(self, config: Dict[str, Any], writes: Sequence[Any], task_id: str, task_path: str = "") -> None:
+        return await asyncio.to_thread(self.put_writes, config, writes, task_id, task_path=task_path)
 
 
 def _get_postgres_saver():
@@ -50,7 +92,7 @@ def _get_postgres_saver():
             conn = psycopg.connect(conn_uri, autocommit=True)
             saver = PostgresSaver(conn)
             saver.setup()
-            return saver
+            return AsyncCompatiblePostgresSaver(saver)
         except Exception as e:
             logger.warning(f"Could not initialize LangGraph PostgresSaver: {e}")
     return None
@@ -343,11 +385,12 @@ class ExecutionService:
             else:
                 final_state = await self._sequential_fallback(initial_state)
         except Exception as exc:
-            logger.error(f"Execution engine error for task {task.id}: {exc}")
+            err_text = str(exc).strip() or exc.__class__.__name__
+            logger.exception(f"Execution engine error for task {task.id}: {err_text}")
             final_state = {
                 **initial_state,
                 "status": "FAILED",
-                "error_message": f"Execution engine crash: {exc}",
+                "error_message": f"Execution engine error: {err_text}",
             }
         finally:
             # Always release execution lock
@@ -403,10 +446,12 @@ class ExecutionService:
             else:
                 final_state = await self._sequential_fallback(resume_state)
         except Exception as exc:
+            err_text = str(exc).strip() or exc.__class__.__name__
+            logger.exception(f"Resume failed for task {task.id}: {err_text}")
             final_state = {
                 **resume_state,
                 "status": "FAILED",
-                "error_message": f"Resume failed: {exc}",
+                "error_message": f"Resume error: {err_text}",
             }
         finally:
             release_execution_lock(db, task.id, lock_token)
