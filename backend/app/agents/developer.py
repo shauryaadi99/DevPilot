@@ -67,6 +67,7 @@ class DeveloperAgent:
         plan: ArchitectPlanOutput,
         workspace_path: Path,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        completed_step_numbers: Optional[set[int]] = None,
     ) -> DeveloperResult:
         """Execute the full approved plan inside workspace_path.
 
@@ -74,6 +75,7 @@ class DeveloperAgent:
             plan: Approved ArchitectPlanOutput.
             workspace_path: Absolute path to cloned task workspace.
             progress_callback: Called with (current_step, total_steps, message) on each step.
+            completed_step_numbers: Set of step numbers already successfully executed (for resume).
 
         Returns:
             DeveloperResult with per-step outcomes.
@@ -90,9 +92,24 @@ class DeveloperAgent:
         step_results: List[StepResult] = []
         steps = plan.implementation_steps
         total = len(steps)
+        completed_set = completed_step_numbers or set()
 
         for i, step in enumerate(steps, start=1):
             step_title = step.title if hasattr(step, "title") else f"Step {i}"
+
+            # Idempotency check: skip already completed steps when resuming
+            if i in completed_set:
+                logger.info(f"Developer Agent — step {i}/{total} ({step_title}) already completed — skipping.")
+                step_results.append(StepResult(
+                    step_number=i,
+                    step_title=step_title,
+                    file_path=step.affected_files[0] if hasattr(step, "affected_files") and step.affected_files else "unknown",
+                    change_type="PRESERVED",
+                    success=True,
+                    explanation=f"Step {i} was completed in previous execution frame.",
+                ))
+                continue
+
             logger.info(f"Developer Agent — step {i}/{total}: {step_title}")
 
             if progress_callback:

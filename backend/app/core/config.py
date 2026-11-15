@@ -39,8 +39,14 @@ class Settings(BaseSettings):
     WORKSPACE_ROOT: str = "./workspaces"
     WORKSPACE_RETENTION_HOURS: int = 72
 
-    # Database settings
-    DATABASE_URL: str = "sqlite:///./devpilot.db"
+    # Database settings (PostgreSQL as sole persistent production database)
+    DATABASE_URL: str = "postgresql+psycopg://devpilot:devpilot_password@localhost:5432/devpilot"
+
+    # Security & Auth settings
+    SECRET_KEY: str = "devpilot-super-secret-key-change-in-production-32chars"
+    GITHUB_CLIENT_ID: Optional[str] = None
+    GITHUB_CLIENT_SECRET: Optional[str] = None
+    GITHUB_REDIRECT_URI: str = "http://localhost:3000/auth/callback"
 
     # Groq LLM settings
     GROQ_API_KEY: str | None = None

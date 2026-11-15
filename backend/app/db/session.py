@@ -1,4 +1,4 @@
-"""Database engine and session management."""
+"""Database engine and session management for PostgreSQL."""
 
 from typing import Any, Dict, Generator
 from sqlalchemy import create_engine, text
@@ -6,17 +6,16 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import get_settings
 from app.core.logging import logger
+from app.db.base import Base
 
 settings = get_settings()
 
-connect_args: Dict[str, Any] = {}
-if settings.DATABASE_URL.startswith("sqlite"):
-    connect_args["check_same_thread"] = False
-
+# Engine configuration for PostgreSQL
 engine = create_engine(
     settings.DATABASE_URL,
-    connect_args=connect_args,
     pool_pre_ping=True,
+    pool_size=10,
+    max_overflow=20,
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -36,10 +35,9 @@ def check_database_connection() -> Dict[str, Any]:
     try:
         with engine.connect() as connection:
             connection.execute(text("SELECT 1"))
-        db_type = "sqlite" if settings.DATABASE_URL.startswith("sqlite") else "postgresql"
         return {
             "status": "connected",
-            "engine": db_type,
+            "engine": "postgresql" if "postgres" in settings.DATABASE_URL else "sqlite",
             "error": None,
         }
     except Exception as e:
@@ -50,3 +48,7 @@ def check_database_connection() -> Dict[str, Any]:
             "error": str(e),
         }
 
+
+def init_db() -> None:
+    """Ensure all application tables exist in PostgreSQL."""
+    Base.metadata.create_all(bind=engine)

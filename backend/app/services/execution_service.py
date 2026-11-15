@@ -1,29 +1,32 @@
 """Execution orchestration service for Chapter 3.
 
-Uses LangGraph StateGraph to manage the autonomous execution pipeline:
-VALIDATING → CLONING → EXECUTING → COMMITTING → COMPLETED / FAILED / CANCELLED
+Uses LangGraph StateGraph with PostgreSQL checkpointing (PostgresSaver) to manage
+the autonomous execution pipeline:
+VALIDATING → CLONING → EXECUTING → COMMITTING → AWAITING_QA / FAILED / CANCELLED
 
-Sandbox: Docker container with --network none, --memory 512m, --cpus 0.5.
-Fallback: subprocess with stripped env, timeout, and workspace restriction.
+Includes:
+- Distributed execution locking (ExecutionLock) to prevent duplicate parallel runs
+- Idempotent step-level execution (skips already applied steps on resume)
+- Commit idempotency (reuses existing commit SHA if working tree already committed)
+- Persistent workspace preservation (never auto-deletes workspaces on completion)
 """
 
 import asyncio
-import os
-import shutil
-import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, Callable, Dict, List, Optional, TypedDict
+import uuid
 
 from sqlalchemy.orm import Session
+from git import Repo
 
 from app.agents.developer import DeveloperAgent, DeveloperResult
 from app.agents.schemas import ArchitectPlanOutput, FileToCreate, FileToModify, ImplementationStep
+from app.core.config import get_settings
 from app.core.logging import logger
-from app.db.models import FileChange, ExecutionLog, Task, TaskExecution
+from app.db.models import FileChange, ExecutionLog, ExecutionLock, Task, TaskExecution
 from app.services.git_service import (
     prepare_task_workspace,
-    create_task_branch,
     stage_and_commit,
     get_workspace_path,
 )
@@ -35,7 +38,75 @@ except ImportError:
     LANGGRAPH_AVAILABLE = False
 
 
-# ── LangGraph State ────────────────────────────────────────────────────────
+def _get_postgres_saver():
+    """Return LangGraph PostgresSaver checkpointer if PostgreSQL is configured."""
+    settings = get_settings()
+    if "postgres" in settings.DATABASE_URL:
+        try:
+            import psycopg
+            from langgraph.checkpoint.postgres import PostgresSaver
+
+            conn_uri = settings.DATABASE_URL.replace("postgresql+psycopg://", "postgresql://")
+            conn = psycopg.connect(conn_uri, autocommit=True)
+            saver = PostgresSaver(conn)
+            saver.setup()
+            return saver
+        except Exception as e:
+            logger.warning(f"Could not initialize LangGraph PostgresSaver: {e}")
+    return None
+
+
+get_checkpointer = _get_postgres_saver
+
+
+# ── Execution Locking Helpers ────────────────────────────────────────────────
+
+
+def acquire_execution_lock(db: Session, task_id: str, execution_id: str) -> Optional[str]:
+    """Acquire execution lock. Returns lock_token on success, None if actively locked."""
+    now = datetime.now(timezone.utc)
+    lock = db.query(ExecutionLock).filter(ExecutionLock.task_id == task_id).first()
+
+    if lock:
+        # Check if lock is still active and fresh (< 60s)
+        if lock.expires_at > now:
+            logger.warning(f"Task {task_id} is locked by execution {lock.execution_id}")
+            return None
+        # Stale/crashed lock — reclaim it
+        logger.info(f"Reclaiming stale lock on task {task_id}")
+        token = str(uuid.uuid4())
+        lock.execution_id = execution_id
+        lock.lock_token = token
+        lock.acquired_at = now
+        lock.heartbeat_at = now
+        lock.expires_at = now + timedelta(seconds=60)
+    else:
+        token = str(uuid.uuid4())
+        lock = ExecutionLock(
+            task_id=task_id,
+            execution_id=execution_id,
+            lock_token=token,
+            acquired_at=now,
+            heartbeat_at=now,
+            expires_at=now + timedelta(seconds=60),
+        )
+        db.add(lock)
+
+    db.commit()
+    return token
+
+
+def release_execution_lock(db: Session, task_id: str, lock_token: Optional[str] = None) -> None:
+    """Release execution lock for a task."""
+    query = db.query(ExecutionLock).filter(ExecutionLock.task_id == task_id)
+    if lock_token:
+        query = query.filter(ExecutionLock.lock_token == lock_token)
+    query.delete()
+    db.commit()
+
+
+# ── LangGraph State ──────────────────────────────────────────────────────────
+
 
 class ExecutionState(TypedDict):
     task_id: str
@@ -50,12 +121,14 @@ class ExecutionState(TypedDict):
     commit_sha: Optional[str]
     status: str  # VALIDATING, CLONING, EXECUTING, COMMITTING, AWAITING_QA, FAILED, CANCELLED
     error_message: Optional[str]
+    completed_steps: Optional[List[int]]
 
 
-# ── Node implementations ───────────────────────────────────────────────────
+# ── Node Implementations ─────────────────────────────────────────────────────
+
 
 def node_validate(state: ExecutionState) -> ExecutionState:
-    """Validate execution pre-conditions (plan, approval already verified by API layer)."""
+    """Validate execution pre-conditions."""
     logger.info(f"[{state['task_id']}] Validating execution preconditions")
     if not state.get("plan"):
         return {**state, "status": "FAILED", "error_message": "No plan provided to execution engine."}
@@ -65,7 +138,7 @@ def node_validate(state: ExecutionState) -> ExecutionState:
 async def node_clone(state: ExecutionState) -> ExecutionState:
     """Prepare persistent workspace (idempotent clone) and ensure task branch."""
     task_id = state["task_id"]
-    logger.info(f"[{task_id}] Preparing workspace")
+    logger.info(f"[{task_id}] Preparing persistent workspace")
     try:
         workspace = await asyncio.get_event_loop().run_in_executor(
             None,
@@ -83,14 +156,13 @@ async def node_clone(state: ExecutionState) -> ExecutionState:
 
 
 async def node_execute(state: ExecutionState) -> ExecutionState:
-    """Run Developer Agent on approved plan inside cloned workspace."""
+    """Run Developer Agent on approved plan with step-level idempotency."""
     task_id = state["task_id"]
     workspace = Path(state["workspace_path"])
     logger.info(f"[{task_id}] Starting Developer Agent execution")
 
     plan_dict = state["plan"]
     try:
-        # Reconstruct ArchitectPlanOutput from stored dict
         plan = ArchitectPlanOutput(
             summary=plan_dict.get("summary", ""),
             repository_understanding=plan_dict.get("repository_understanding", ""),
@@ -105,8 +177,14 @@ async def node_execute(state: ExecutionState) -> ExecutionState:
     except Exception as exc:
         return {**state, "status": "FAILED", "error_message": f"Plan reconstruction failed: {exc}"}
 
+    completed_set = set(state.get("completed_steps") or [])
+
     agent = DeveloperAgent()
-    result = await agent.implement(plan=plan, workspace_path=workspace)
+    result = await agent.implement(
+        plan=plan,
+        workspace_path=workspace,
+        completed_step_numbers=completed_set,
+    )
 
     result_dict = {
         "success": result.success,
@@ -137,33 +215,41 @@ async def node_execute(state: ExecutionState) -> ExecutionState:
 
 
 async def node_commit(state: ExecutionState) -> ExecutionState:
-    """Stage all changes and commit to task branch."""
+    """Stage all changes and commit to task branch with idempotency check."""
     task_id = state["task_id"]
     workspace = Path(state["workspace_path"])
     logger.info(f"[{task_id}] Committing changes to branch {state['branch_name']}")
+
+    def _do_commit():
+        repo = Repo(str(workspace))
+        # If already committed in a prior run and working tree is clean:
+        if not repo.is_dirty(untracked_files=True):
+            if repo.head.is_valid():
+                commit_msg = repo.head.commit.message
+                if f"implement task {task_id}" in commit_msg:
+                    logger.info(f"Reusing existing commit {repo.head.commit.hexsha[:7]}")
+                    return repo.head.commit.hexsha
+            return None
+        return stage_and_commit(workspace, f"feat(devpilot): implement task {task_id}")
+
     try:
-        sha = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: stage_and_commit(workspace, f"feat(devpilot): implement task {task_id}")
-        )
+        sha = await asyncio.get_event_loop().run_in_executor(None, _do_commit)
         return {**state, "status": "AWAITING_QA", "commit_sha": sha}
     except RuntimeError as exc:
-        # "Nothing to commit" is not fatal — treat as success without commit
         if "Nothing to commit" in str(exc):
-            logger.warning(f"[{task_id}] No changes detected after execution.")
             return {**state, "status": "AWAITING_QA", "commit_sha": None}
         return {**state, "status": "FAILED", "error_message": str(exc)}
 
 
 def _route(state: ExecutionState) -> str:
-    """Conditional routing based on current status."""
     return state["status"]
 
 
-# ── Graph assembly ─────────────────────────────────────────────────────────
+# ── Graph Assembly ───────────────────────────────────────────────────────────
 
-def build_execution_graph():
-    """Build and compile the LangGraph execution StateGraph."""
+
+def build_execution_graph(checkpointer=None):
+    """Build and compile the LangGraph execution StateGraph with checkpointer."""
     graph = StateGraph(ExecutionState)
     graph.add_node("VALIDATING", node_validate)
     graph.add_node("CLONING", node_clone)
@@ -189,17 +275,21 @@ def build_execution_graph():
         "FAILED": END,
     })
 
+    if checkpointer:
+        return graph.compile(checkpointer=checkpointer)
     return graph.compile()
 
 
-# ── Execution service ──────────────────────────────────────────────────────
+# ── Execution Service ────────────────────────────────────────────────────────
+
 
 class ExecutionService:
-    """Orchestrates plan execution and persists results to DB."""
+    """Orchestrates plan execution, checkpointing, and DB persistence."""
 
     def __init__(self):
+        self._checkpointer = _get_postgres_saver()
         if LANGGRAPH_AVAILABLE:
-            self._graph = build_execution_graph()
+            self._graph = build_execution_graph(checkpointer=self._checkpointer)
         else:
             self._graph = None
             logger.warning("LangGraph not available; sequential fallback will be used.")
@@ -211,14 +301,16 @@ class ExecutionService:
         execution: TaskExecution,
         github_token: Optional[str] = None,
     ) -> None:
-        """Run the execution pipeline and update DB records throughout.
+        """Run execution pipeline with locking and checkpoint recovery."""
+        # 1. Acquire execution lock
+        lock_token = acquire_execution_lock(db, task.id, execution.id)
+        if not lock_token:
+            execution.status = "FAILED"
+            execution.error_message = "Task execution is already running on another worker."
+            execution.completed_at = datetime.now(timezone.utc)
+            db.commit()
+            return
 
-        Args:
-            db: Active SQLAlchemy session.
-            task: Task ORM instance (must have APPROVED status).
-            execution: TaskExecution ORM instance (status=PENDING).
-            github_token: GitHub PAT for cloning (never stored in DB).
-        """
         plan_data = None
         if task.implementation_plan:
             plan_data = task.implementation_plan.__dict__.copy()
@@ -227,9 +319,7 @@ class ExecutionService:
         initial_state: ExecutionState = {
             "task_id": task.id,
             "execution_id": execution.id,
-            "repo_clone_url": task.repository.html_url.replace(
-                "https://github.com/", "https://github.com/"  # keep HTTPS
-            ),
+            "repo_clone_url": task.repository.html_url,
             "github_token": github_token,
             "default_branch": task.repository.default_branch,
             "plan": plan_data,
@@ -239,18 +329,18 @@ class ExecutionService:
             "commit_sha": None,
             "status": "VALIDATING",
             "error_message": None,
+            "completed_steps": [],
         }
 
-        # Persist CLONING status
         execution.status = "CLONING"
         task.status = "EXECUTING"
         db.commit()
 
         try:
             if self._graph:
-                final_state = await self._graph.ainvoke(initial_state)
+                config = {"configurable": {"thread_id": task.id}}
+                final_state = await self._graph.ainvoke(initial_state, config=config)
             else:
-                # Minimal sequential fallback (no LangGraph)
                 final_state = await self._sequential_fallback(initial_state)
         except Exception as exc:
             logger.error(f"Execution engine error for task {task.id}: {exc}")
@@ -259,8 +349,68 @@ class ExecutionService:
                 "status": "FAILED",
                 "error_message": f"Execution engine crash: {exc}",
             }
+        finally:
+            # Always release execution lock
+            release_execution_lock(db, task.id, lock_token)
 
-        # Persist final state to DB
+        self._persist_results(db, task, execution, final_state)
+
+    async def resume_plan(
+        self,
+        db: Session,
+        task: Task,
+        execution: TaskExecution,
+        github_token: Optional[str] = None,
+    ) -> None:
+        """Resume an interrupted execution without repeating completed steps."""
+        lock_token = acquire_execution_lock(db, task.id, execution.id)
+        if not lock_token:
+            raise RuntimeError("Task execution is already running on another worker.")
+
+        # Determine already completed steps from FileChange / logs
+        completed_step_numbers = [
+            fc.execution_id for fc in execution.file_changes
+        ]
+        completed_steps = [
+            log.step_number for log in execution.logs if log.agent == "DeveloperAgent" and log.level == "INFO"
+        ]
+
+        plan_data = None
+        if task.implementation_plan:
+            plan_data = task.implementation_plan.__dict__.copy()
+            plan_data.pop("_sa_instance_state", None)
+
+        resume_state: ExecutionState = {
+            "task_id": task.id,
+            "execution_id": execution.id,
+            "repo_clone_url": task.repository.html_url,
+            "github_token": github_token,
+            "default_branch": task.repository.default_branch,
+            "plan": plan_data,
+            "workspace_path": execution.workspace_path or str(get_workspace_path(task.id)),
+            "branch_name": execution.branch_name or f"devpilot/task-{task.id}",
+            "developer_result": None,
+            "commit_sha": execution.commit_sha,
+            "status": "EXECUTING",
+            "error_message": None,
+            "completed_steps": completed_steps,
+        }
+
+        try:
+            if self._graph:
+                config = {"configurable": {"thread_id": task.id}}
+                final_state = await self._graph.ainvoke(resume_state, config=config)
+            else:
+                final_state = await self._sequential_fallback(resume_state)
+        except Exception as exc:
+            final_state = {
+                **resume_state,
+                "status": "FAILED",
+                "error_message": f"Resume failed: {exc}",
+            }
+        finally:
+            release_execution_lock(db, task.id, lock_token)
+
         self._persist_results(db, task, execution, final_state)
 
     def _persist_results(
@@ -280,7 +430,6 @@ class ExecutionService:
         execution.error_message = state.get("error_message")
         execution.completed_at = datetime.now(timezone.utc)
 
-        # Map internal AWAITING_QA -> task status (FAILED/CANCELLED pass through)
         task.status = status  # AWAITING_QA, FAILED, CANCELLED
 
         dev_result = state.get("developer_result") or {}
@@ -288,17 +437,21 @@ class ExecutionService:
         execution.total_steps = dev_result.get("steps_total", 0)
         execution.current_step = dev_result.get("steps_completed", 0)
 
-        # Persist FileChange records
+        # Existing file change paths to avoid duplicating on resume
+        existing_paths = {fc.file_path for fc in execution.file_changes}
+
         for sr in step_results:
-            fc = FileChange(
-                execution_id=execution.id,
-                file_path=sr["file_path"],
-                change_type=sr["change_type"],
-                diff_summary=sr.get("diff_summary", ""),
-                lines_added=sr.get("lines_added", 0),
-                lines_removed=sr.get("lines_removed", 0),
-            )
-            db.add(fc)
+            if sr["file_path"] not in existing_paths and sr.get("change_type") != "PRESERVED":
+                fc = FileChange(
+                    execution_id=execution.id,
+                    file_path=sr["file_path"],
+                    change_type=sr["change_type"],
+                    diff_summary=sr.get("diff_summary", ""),
+                    lines_added=sr.get("lines_added", 0),
+                    lines_removed=sr.get("lines_removed", 0),
+                )
+                db.add(fc)
+                existing_paths.add(sr["file_path"])
 
             level = "INFO" if sr["success"] else "ERROR"
             msg = sr.get("explanation") or sr.get("error") or f"Step {sr['step_number']}"
@@ -311,7 +464,6 @@ class ExecutionService:
             )
             db.add(log)
 
-        # Final status log
         final_msg = f"Execution {status}." + (
             f" Commit: {state['commit_sha']}" if state.get("commit_sha") else ""
         ) + (
@@ -325,7 +477,6 @@ class ExecutionService:
             message=final_msg,
         ))
         db.commit()
-        # Workspace is preserved — cleanup only on explicit task closure via POST /close
 
     async def _sequential_fallback(self, state: ExecutionState) -> ExecutionState:
         """Minimal sequential pipeline when LangGraph is not available."""
@@ -339,4 +490,3 @@ class ExecutionService:
         if state["status"] == "FAILED":
             return state
         return await node_commit(state)
-

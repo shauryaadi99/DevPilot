@@ -16,6 +16,11 @@ async def lifespan(app: FastAPI):
     setup_logging()
     settings = get_settings()
     logger.info(f"Starting {settings.PROJECT_NAME} backend v{settings.VERSION} [{settings.ENVIRONMENT}]")
+    try:
+        from app.db.session import init_db
+        init_db()
+    except Exception as e:
+        logger.warning(f"Database init warning: {e}")
     yield
     logger.info(f"Shutting down {settings.PROJECT_NAME} backend")
 

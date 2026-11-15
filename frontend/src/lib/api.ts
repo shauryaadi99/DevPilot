@@ -38,6 +38,34 @@ export interface GroqTestResult {
   message: string;
 }
 
+export interface UserProfile {
+  id: string;
+  username: string;
+  name?: string;
+  email?: string;
+  avatar_url?: string;
+}
+
+export interface PatStatus {
+  has_pat: boolean;
+  is_valid: boolean;
+  pat_masked: string | null;
+  scopes: string[];
+  last_validated_at?: string;
+  message?: string;
+}
+
+export interface SessionState {
+  authenticated: boolean;
+  user: UserProfile | null;
+  pat_status: PatStatus;
+  active_chapter: string;
+  selected_repository: GitHubRepo | null;
+  current_task: TaskDetail | null;
+  execution: ExecutionStatus | null;
+  can_resume: boolean;
+}
+
 export interface GitHubUser {
   login: string;
   name?: string;
@@ -47,7 +75,7 @@ export interface GitHubUser {
 }
 
 export interface GitHubRepo {
-  id?: number;
+  id?: number | string;
   name: string;
   full_name: string;
   owner: string;
@@ -58,6 +86,30 @@ export interface GitHubRepo {
   language?: string | null;
   stargazers_count?: number;
   updated_at?: string;
+}
+
+export interface TreeSummary {
+  total_files: number;
+  key_paths: string[];
+}
+
+export interface InspectionData {
+  tree_summary: TreeSummary;
+  detected_languages: string[];
+  detected_frameworks: string[];
+  detected_entrypoints: string[];
+  manifests_summary: Record<string, any>;
+  confirmed_facts: string[];
+  unknowns: string[];
+}
+
+export interface RequirementAnalysisData {
+  requirement_summary: string;
+  functional_requirements: string[];
+  nonfunctional_requirements: string[];
+  acceptance_criteria: string[];
+  ambiguities: string[];
+  clarification_questions: string[];
 }
 
 export interface FileToCreate {
@@ -84,31 +136,9 @@ export interface ImplementationStep {
   affected_files: string[];
 }
 
-export interface InspectionData {
-  tree_summary: {
-    total_files: number;
-    manifest_count: number;
-    key_paths: string[];
-  };
-  detected_languages: string[];
-  detected_frameworks: string[];
-  detected_entrypoints: string[];
-  manifests_summary: Record<string, string>;
-  confirmed_facts: string[];
-  unknowns: string[];
-}
-
-export interface RequirementAnalysisData {
-  requirement_summary: string;
-  functional_requirements: string[];
-  nonfunctional_requirements: string[];
-  acceptance_criteria: string[];
-  ambiguities: string[];
-  clarification_questions: string[];
-}
-
 export interface ImplementationPlanData {
   id: string;
+  version: number;
   summary: string;
   repository_understanding: string;
   confirmed_observations: string[];
@@ -117,12 +147,7 @@ export interface ImplementationPlanData {
   api_contract_changes: ApiContractChange[];
   implementation_steps: ImplementationStep[];
   dependencies: string[];
-  testing_strategy: {
-    unit_tests?: string[];
-    integration_tests?: string[];
-    manual_checks?: string[];
-    [key: string]: any;
-  };
+  testing_strategy: Record<string, any>;
   risks_and_assumptions: string[];
 }
 
@@ -140,87 +165,178 @@ export interface TaskDetail {
   status: string;
   created_at: string;
   updated_at: string;
-  repository: {
-    id: string;
-    name: string;
-    full_name: string;
-    owner: string;
-    default_branch: string;
-    html_url: string;
-  };
+  repository: GitHubRepo;
   inspection?: InspectionData | null;
   requirement_analysis?: RequirementAnalysisData | null;
   implementation_plan?: ImplementationPlanData | null;
-  approvals: PlanApprovalData[];
+  latest_approval?: PlanApprovalData | null;
+  approvals?: PlanApprovalData[];
 }
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
+// ── Health & Diagnostics ───────────────────────────────────────────────────
+
 export async function fetchHealth(): Promise<HealthResponse> {
-  const url = `${API_BASE_URL}/api/v1/health`;
-  const response = await fetch(url, {
+  const url = `${API_BASE_URL}/health`;
+  const res = await fetch(url, {
     cache: "no-store",
+    credentials: "include",
     headers: { "Accept": "application/json" },
   });
-
-  if (!response.ok) {
-    throw new Error(`Backend returned HTTP status ${response.status}: ${response.statusText}`);
+  if (!res.ok) {
+    throw new Error(`Health check request failed with HTTP ${res.status}`);
   }
-
-  return response.json();
+  return res.json();
 }
 
 export async function testGroqConnection(): Promise<GroqTestResult> {
-  const url = `${API_BASE_URL}/api/v1/llm/test`;
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Accept": "application/json" },
-  });
-
-  if (!response.ok) {
-    throw new Error(`LLM test returned HTTP ${response.status}: ${response.statusText}`);
-  }
-
-  return response.json();
-}
-
-export async function connectGitHub(token: string): Promise<{ status: string; user: GitHubUser }> {
-  const url = `${API_BASE_URL}/api/v1/github/connect`;
+  const url = `${API_BASE_URL}/api/v1/llm/groq/test`;
   const res = await fetch(url, {
     method: "POST",
+    credentials: "include",
+    headers: { "Accept": "application/json" },
+  });
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({}));
+    throw new Error(errorData.detail || `Groq test failed with status ${res.status}`);
+  }
+  return res.json();
+}
+
+// ── Authentication & PAT ───────────────────────────────────────────────────
+
+export async function getGithubLoginUrl(): Promise<{ oauth_url: string }> {
+  const res = await fetch(`${API_BASE_URL}/api/v1/auth/github/login`, {
+    credentials: "include",
+    headers: { "Accept": "application/json" },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || "Failed to initiate GitHub OAuth login.");
+  }
+  return res.json();
+}
+
+export async function devLogin(username: string): Promise<{ status: string; session_id: string; user: UserProfile }> {
+  const res = await fetch(`${API_BASE_URL}/api/v1/auth/dev-login`, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json", "Accept": "application/json" },
+    body: JSON.stringify({ username }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || "Dev login failed.");
+  }
+  return res.json();
+}
+
+export async function submitPat(token: string): Promise<{ status: string; pat_masked: string; scopes: string[]; user: any; message: string }> {
+  const res = await fetch(`${API_BASE_URL}/api/v1/auth/pat`, {
+    method: "POST",
+    credentials: "include",
     headers: { "Content-Type": "application/json", "Accept": "application/json" },
     body: JSON.stringify({ token }),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || `GitHub connection failed with status ${res.status}`);
+    throw new Error(err.detail || `PAT submission failed: ${res.status}`);
   }
   return res.json();
 }
 
-export async function listUserRepositories(token: string): Promise<GitHubRepo[]> {
-  const url = `${API_BASE_URL}/api/v1/github/repos`;
-  const res = await fetch(url, {
-    headers: {
-      "Accept": "application/json",
-      "X-GitHub-Token": token,
-    },
+export async function getPatStatus(): Promise<PatStatus> {
+  const res = await fetch(`${API_BASE_URL}/api/v1/auth/pat/status`, {
+    credentials: "include",
+    headers: { "Accept": "application/json" },
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || `Failed to list repositories: ${res.status}`);
+    throw new Error(err.detail || "Failed to check PAT status.");
   }
-  const data = await res.json();
-  return data.repositories;
+  return res.json();
 }
 
-export async function selectRepository(repo: GitHubRepo): Promise<{ status: string; repository: any }> {
+export async function logout(): Promise<void> {
+  await fetch(`${API_BASE_URL}/api/v1/auth/logout`, {
+    method: "POST",
+    credentials: "include",
+  }).catch(() => {});
+}
+
+// ── Session & Rehydration ──────────────────────────────────────────────────
+
+export async function getSessionState(): Promise<SessionState> {
+  const res = await fetch(`${API_BASE_URL}/api/v1/session/state`, {
+    cache: "no-store",
+    credentials: "include",
+    headers: { "Accept": "application/json" },
+  });
+  if (!res.ok) {
+    throw new Error(`Failed to retrieve session state: ${res.status}`);
+  }
+  return res.json();
+}
+
+// ── GitHub & Repositories ──────────────────────────────────────────────────
+
+export async function connectGitHub(token: string): Promise<{ status: string; user: GitHubUser }> {
+  // Legacy / Direct connect shim
+  const url = `${API_BASE_URL}/api/v1/github/connect`;
+  const res = await fetch(url, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json", "Accept": "application/json" },
+    body: JSON.stringify({ token }),
+  });
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({}));
+    throw new Error(errorData.detail || `GitHub authorization failed with status ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function listRepositories(token?: string): Promise<GitHubRepo[]> {
+  const url = `${API_BASE_URL}/api/v1/github/repos`;
+  const headers: Record<string, string> = { "Accept": "application/json" };
+  if (token) {
+    headers["X-GitHub-Token"] = token;
+  }
+  const res = await fetch(url, {
+    credentials: "include",
+    headers,
+  });
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({}));
+    throw new Error(errorData.detail || `Failed to fetch repositories: ${res.status}`);
+  }
+  const data = await res.json();
+  return data.repositories || [];
+}
+
+export const listUserRepositories = listRepositories;
+
+export async function getSavedRepositories(): Promise<GitHubRepo[]> {
+  const res = await fetch(`${API_BASE_URL}/api/v1/github/saved-repos`, {
+    credentials: "include",
+    headers: { "Accept": "application/json" },
+  });
+  if (!res.ok) {
+    return [];
+  }
+  const data = await res.json();
+  return data.repositories || [];
+}
+
+export async function selectRepository(repo: GitHubRepo): Promise<{ status: string; repository: GitHubRepo }> {
   const url = `${API_BASE_URL}/api/v1/github/select`;
   const res = await fetch(url, {
     method: "POST",
+    credentials: "include",
     headers: { "Content-Type": "application/json", "Accept": "application/json" },
     body: JSON.stringify({
-      github_id: repo.id,
+      github_id: repo.id ? (typeof repo.id === "string" ? parseInt(repo.id, 10) || null : repo.id) : null,
       name: repo.name,
       full_name: repo.full_name,
       owner: repo.owner,
@@ -231,16 +347,19 @@ export async function selectRepository(repo: GitHubRepo): Promise<{ status: stri
     }),
   });
   if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || `Failed to select repository: ${res.status}`);
+    const errorData = await res.json().catch(() => ({}));
+    throw new Error(errorData.detail || `Failed to persist repository selection: ${res.status}`);
   }
   return res.json();
 }
+
+// ── Tasks & Planning ───────────────────────────────────────────────────────
 
 export async function createTask(repoId: string, title: string, requirement: string): Promise<any> {
   const url = `${API_BASE_URL}/api/v1/tasks`;
   const res = await fetch(url, {
     method: "POST",
+    credentials: "include",
     headers: { "Content-Type": "application/json", "Accept": "application/json" },
     body: JSON.stringify({ repository_id: repoId, title, requirement }),
   });
@@ -254,7 +373,7 @@ export async function createTask(repoId: string, title: string, requirement: str
 export async function getTask(taskId: string): Promise<TaskDetail> {
   const url = `${API_BASE_URL}/api/v1/tasks/${taskId}`;
   const res = await fetch(url, {
-    cache: "no-store",
+    credentials: "include",
     headers: { "Accept": "application/json" },
   });
   if (!res.ok) {
@@ -272,11 +391,12 @@ export async function runTaskPipeline(taskId: string, token?: string): Promise<T
   }
   const res = await fetch(url, {
     method: "POST",
+    credentials: "include",
     headers,
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error(err.detail || `Pipeline execution failed: ${res.status}`);
+    throw new Error(err.detail || `Task pipeline failed: ${res.status}`);
   }
   return res.json();
 }
@@ -289,6 +409,7 @@ export async function submitPlanApproval(
   const url = `${API_BASE_URL}/api/v1/tasks/${taskId}/approval`;
   const res = await fetch(url, {
     method: "POST",
+    credentials: "include",
     headers: { "Content-Type": "application/json", "Accept": "application/json" },
     body: JSON.stringify({ decision, feedback }),
   });
@@ -299,12 +420,11 @@ export async function submitPlanApproval(
   return res.json();
 }
 
-
-// ── Chapter 3: Execution API ───────────────────────────────────────────────
+// ── Chapter 3 Execution ────────────────────────────────────────────────────
 
 export interface FileChangeData {
   file_path: string;
-  change_type: "CREATE" | "MODIFY" | "DELETE";
+  change_type: "CREATE" | "MODIFY" | "DELETE" | string;
   diff_summary: string;
   lines_added: number;
   lines_removed: number;
@@ -340,6 +460,7 @@ export async function executeTask(
   const url = `${API_BASE_URL}/api/v1/tasks/${taskId}/execute`;
   const res = await fetch(url, {
     method: "POST",
+    credentials: "include",
     headers: { "Content-Type": "application/json", "Accept": "application/json" },
     body: JSON.stringify({ github_token: githubToken || null }),
   });
@@ -350,10 +471,27 @@ export async function executeTask(
   return res.json();
 }
 
+export async function resumeExecution(
+  taskId: string,
+): Promise<{ status: string; execution_id: string; task_id: string; message: string }> {
+  const url = `${API_BASE_URL}/api/v1/tasks/${taskId}/resume`;
+  const res = await fetch(url, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Accept": "application/json" },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Resume failed: ${res.status}`);
+  }
+  return res.json();
+}
+
 export async function getExecutionStatus(taskId: string): Promise<ExecutionStatus> {
   const url = `${API_BASE_URL}/api/v1/tasks/${taskId}/execution`;
   const res = await fetch(url, {
     cache: "no-store",
+    credentials: "include",
     headers: { "Accept": "application/json" },
   });
   if (!res.ok) {
@@ -369,6 +507,7 @@ export async function cancelExecution(
   const url = `${API_BASE_URL}/api/v1/tasks/${taskId}/cancel`;
   const res = await fetch(url, {
     method: "POST",
+    credentials: "include",
     headers: { "Accept": "application/json" },
   });
   if (!res.ok) {
@@ -384,6 +523,7 @@ export async function closeTask(
   const url = `${API_BASE_URL}/api/v1/tasks/${taskId}/close`;
   const res = await fetch(url, {
     method: "POST",
+    credentials: "include",
     headers: { "Accept": "application/json" },
   });
   if (!res.ok) {

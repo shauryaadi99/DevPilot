@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { Header } from "@/components/layout/Header";
 import { Sidebar } from "@/components/layout/Sidebar";
 import { StatusBadge } from "@/components/ui/StatusBadge";
+import { PatModal } from "@/components/auth/PatModal";
 import {
   fetchHealth,
   testGroqConnection,
@@ -14,15 +15,25 @@ import {
   runTaskPipeline,
   submitPlanApproval,
   executeTask,
+  resumeExecution,
   getExecutionStatus,
   cancelExecution,
   closeTask,
+  getSessionState,
+  submitPat,
+  getPatStatus,
+  devLogin,
+  logout,
+  getSavedRepositories,
+  getGithubLoginUrl,
   type HealthResponse,
   type GroqTestResult,
   type GitHubUser,
   type GitHubRepo,
   type TaskDetail,
   type ExecutionStatus,
+  type UserProfile,
+  type PatStatus,
 } from "@/lib/api";
 import {
   Database,
@@ -64,6 +75,12 @@ export default function WorkspacePage() {
   const [healthError, setHealthError] = useState<string | null>(null);
   const [testingGroq, setTestingGroq] = useState<boolean>(false);
   const [groqTestResult, setGroqTestResult] = useState<GroqTestResult | null>(null);
+
+  // User & Authentication State
+  const [user, setUser] = useState<UserProfile | null>(null);
+  const [patStatus, setPatStatus] = useState<PatStatus | null>(null);
+  const [isPatModalOpen, setIsPatModalOpen] = useState<boolean>(false);
+  const [canResume, setCanResume] = useState<boolean>(false);
 
   // Chapter 2 GitHub & Task State
   const [githubToken, setGithubToken] = useState<string>("");
@@ -110,6 +127,79 @@ export default function WorkspacePage() {
     }
   };
 
+  const initSession = async () => {
+    try {
+      const state = await getSessionState();
+      if (state.authenticated && state.user) {
+        setUser(state.user);
+        setGithubUser({
+          login: state.user.username,
+          name: state.user.name,
+          avatar_url: state.user.avatar_url,
+          html_url: `https://github.com/${state.user.username}`,
+          public_repos: 0,
+        });
+      }
+      if (state.pat_status) {
+        setPatStatus(state.pat_status);
+        if (state.pat_status.has_pat && state.pat_status.is_valid) {
+          loadRepositories();
+        } else {
+          loadSavedRepos();
+        }
+      } else {
+        loadSavedRepos();
+      }
+      if (state.selected_repository) {
+        setSelectedRepo(state.selected_repository);
+      }
+      if (state.current_task) {
+        setCurrentTask(state.current_task);
+        if (state.current_task.title) setTaskTitle(state.current_task.title);
+        if (state.current_task.requirement) setTaskRequirement(state.current_task.requirement);
+      }
+      if (state.execution) {
+        setExecutionStatus(state.execution);
+        if (["CLONING", "EXECUTING", "COMMITTING"].includes(state.execution.status)) {
+          setPollingExecution(true);
+          pollExecutionStatus(state.execution.task_id);
+        }
+      }
+      setCanResume(state.can_resume || false);
+    } catch (err: any) {
+      console.warn("Session rehydration:", err?.message || err);
+      loadSavedRepos();
+    }
+  };
+
+  const loadSavedRepos = async () => {
+    try {
+      const saved = await getSavedRepositories();
+      if (saved && saved.length > 0) {
+        setRepositories(saved);
+      }
+    } catch {
+      // Ignore
+    }
+  };
+
+  const loadRepositories = async () => {
+    try {
+      setLoadingRepos(true);
+      const repos = await listUserRepositories();
+      if (repos && repos.length > 0) {
+        setRepositories(repos);
+      } else {
+        loadSavedRepos();
+      }
+    } catch (err: any) {
+      console.warn("Direct repo listing failed, fetching saved repos:", err?.message);
+      loadSavedRepos();
+    } finally {
+      setLoadingRepos(false);
+    }
+  };
+
   const handleTestGroq = async () => {
     try {
       setTestingGroq(true);
@@ -129,6 +219,58 @@ export default function WorkspacePage() {
     }
   };
 
+  const handleLogin = async () => {
+    try {
+      const data = await getGithubLoginUrl();
+      if (data.oauth_url) {
+        window.location.href = data.oauth_url;
+        return;
+      }
+    } catch {
+      // Fallback to dev login if GitHub OAuth credentials not configured
+    }
+    handleDevLogin();
+  };
+
+  const handleDevLogin = async () => {
+    try {
+      const res = await devLogin("developer");
+      setUser(res.user);
+      setGithubUser({
+        login: res.user.username,
+        name: res.user.name,
+        avatar_url: res.user.avatar_url,
+        html_url: `https://github.com/${res.user.username}`,
+        public_repos: 0,
+      });
+      const pStatus = await getPatStatus();
+      setPatStatus(pStatus);
+      if (!pStatus.has_pat) {
+        setIsPatModalOpen(true);
+      } else if (pStatus.is_valid) {
+        loadRepositories();
+      }
+    } catch (err: any) {
+      setGithubError(err?.message || "Dev login failed.");
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await logout();
+      setUser(null);
+      setGithubUser(null);
+      setPatStatus(null);
+      setRepositories([]);
+      setSelectedRepo(null);
+      setCurrentTask(null);
+      setExecutionStatus(null);
+      setCanResume(false);
+    } catch (err: any) {
+      console.error("Logout failed:", err);
+    }
+  };
+
   const handleConnectGitHub = async () => {
     if (!githubToken.trim()) {
       setGithubError("Please enter a valid GitHub token.");
@@ -137,25 +279,35 @@ export default function WorkspacePage() {
     try {
       setConnectingGithub(true);
       setGithubError(null);
-      const res = await connectGitHub(githubToken);
-      setGithubUser(res.user);
-      loadRepositories(githubToken);
+      const res = await submitPat(githubToken.trim());
+      setPatStatus({
+        has_pat: true,
+        is_valid: true,
+        pat_masked: res.pat_masked,
+        scopes: res.scopes || [],
+        last_validated_at: new Date().toISOString(),
+      });
+      if (res.user) {
+        setGithubUser({
+          login: res.user.login,
+          name: res.user.name,
+          avatar_url: res.user.avatar_url,
+          html_url: `https://github.com/${res.user.login}`,
+          public_repos: 0,
+        });
+        setUser({
+          id: res.user.login,
+          username: res.user.login,
+          name: res.user.name,
+          avatar_url: res.user.avatar_url,
+        });
+      }
+      setGithubToken("");
+      loadRepositories();
     } catch (err: any) {
       setGithubError(err?.message || "GitHub authentication failed.");
     } finally {
       setConnectingGithub(false);
-    }
-  };
-
-  const loadRepositories = async (token: string) => {
-    try {
-      setLoadingRepos(true);
-      const repos = await listUserRepositories(token);
-      setRepositories(repos);
-    } catch (err: any) {
-      setGithubError(err?.message || "Failed to list repositories.");
-    } finally {
-      setLoadingRepos(false);
     }
   };
 
@@ -184,13 +336,13 @@ export default function WorkspacePage() {
 
       // 1. Create or persist repository in backend
       const repoRes = await selectRepository(selectedRepo);
-      const backendRepoId = repoRes.repository.id;
+      const backendRepoId = String(repoRes.repository.id || "");
 
       // 2. Create task
       const newTask = await createTask(backendRepoId, taskTitle, taskRequirement);
 
       // 3. Run full intelligence pipeline
-      const taskDetail = await runTaskPipeline(newTask.id, githubToken || undefined);
+      const taskDetail = await runTaskPipeline(newTask.id);
       setCurrentTask(taskDetail);
     } catch (err: any) {
       console.error("Pipeline failure:", err);
@@ -224,7 +376,7 @@ export default function WorkspacePage() {
           ...currentTask,
           status: decision,
           approvals: [
-            ...currentTask.approvals,
+            ...(currentTask.approvals || []),
             {
               id: result.approval.id,
               decision: result.approval.decision,
@@ -261,12 +413,26 @@ export default function WorkspacePage() {
       setExecutingPlan(true);
       setExecutionError(null);
       setExecutionStatus(null);
-      await executeTask(currentTask.id, githubToken || undefined);
+      await executeTask(currentTask.id);
       // Start polling
       setPollingExecution(true);
       pollExecutionStatus(currentTask.id);
     } catch (err: any) {
       setExecutionError(err?.message || "Failed to start execution.");
+      setExecutingPlan(false);
+    }
+  };
+
+  const handleResumePlan = async () => {
+    if (!currentTask) return;
+    try {
+      setExecutingPlan(true);
+      setExecutionError(null);
+      await resumeExecution(currentTask.id);
+      setPollingExecution(true);
+      pollExecutionStatus(currentTask.id);
+    } catch (err: any) {
+      setExecutionError(err?.message || "Failed to resume execution.");
       setExecutingPlan(false);
     }
   };
@@ -309,6 +475,7 @@ export default function WorkspacePage() {
 
   useEffect(() => {
     loadHealthData();
+    initSession();
   }, []);
 
   const backendOnline = !healthError && health !== null;
@@ -321,7 +488,23 @@ export default function WorkspacePage() {
 
   return (
     <div className="min-h-screen flex flex-col bg-[#090d16] text-gray-100">
-      <Header backendOnline={backendOnline} />
+      <Header
+        backendOnline={backendOnline}
+        user={user}
+        patStatus={patStatus}
+        onOpenPatModal={() => setIsPatModalOpen(true)}
+        onLogin={handleLogin}
+        onLogout={handleLogout}
+      />
+      <PatModal
+        isOpen={isPatModalOpen}
+        patStatus={patStatus}
+        onClose={() => setIsPatModalOpen(false)}
+        onSaved={(newStatus) => {
+          setPatStatus(newStatus);
+          loadRepositories();
+        }}
+      />
 
       <div className="flex flex-1 overflow-hidden">
         <Sidebar activeTab={activeTab} onTabChange={setActiveTab} />
@@ -360,38 +543,72 @@ export default function WorkspacePage() {
                       <Github className="w-5 h-5" />
                     </div>
                     <div>
-                      <h3 className="text-sm font-semibold text-white">GitHub Authorization</h3>
+                      <h3 className="text-sm font-semibold text-white">GitHub Authorization &amp; Repository Access</h3>
                       <p className="text-xs text-gray-400">
-                        {githubUser ? (
-                          <span className="text-emerald-400 flex items-center gap-1.5 mt-0.5">
-                            <CheckCircle className="w-3.5 h-3.5" /> Connected as{" "}
-                            <span className="font-semibold text-white">{githubUser.login}</span> ({githubUser.public_repos} repos)
-                          </span>
+                        {user ? (
+                          patStatus?.has_pat && patStatus?.is_valid ? (
+                            <span className="text-emerald-400 flex items-center gap-1.5 mt-0.5">
+                              <CheckCircle className="w-3.5 h-3.5" /> Authenticated as{" "}
+                              <span className="font-semibold text-white">{user.username}</span> • PAT:{" "}
+                              <span className="font-mono text-emerald-300">{patStatus.pat_masked || "Active"}</span> (Encrypted)
+                            </span>
+                          ) : (
+                            <span className="text-amber-400 flex items-center gap-1.5 mt-0.5">
+                              <AlertTriangle className="w-3.5 h-3.5" /> Signed in as{" "}
+                              <span className="font-semibold text-white">{user.username}</span>. Personal Access Token required to clone and modify code.
+                            </span>
+                          )
                         ) : (
-                          "Enter a Personal Access Token (PAT) with repo scope for zero-friction access."
+                          "Sign in with GitHub or enter a Personal Access Token (PAT) with repo scope."
                         )}
                       </p>
                     </div>
                   </div>
 
-                  {!githubUser && (
-                    <div className="flex items-center gap-2">
-                      <input
-                        type="password"
-                        placeholder="ghp_xxxxxxxxxxxx"
-                        value={githubToken}
-                        onChange={(e) => setGithubToken(e.target.value)}
-                        className="px-3 py-1.5 rounded-lg bg-gray-950 border border-gray-700 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 w-64 font-mono"
-                      />
+                  <div className="flex items-center gap-2">
+                    {user ? (
                       <button
-                        onClick={handleConnectGitHub}
-                        disabled={connectingGithub}
-                        className="px-4 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-xs font-medium text-white transition-colors disabled:opacity-50"
+                        type="button"
+                        onClick={() => setIsPatModalOpen(true)}
+                        className="px-4 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-xs font-medium text-white transition-colors"
                       >
-                        {connectingGithub ? "Connecting..." : "Connect"}
+                        {patStatus?.has_pat ? "Manage PAT" : "Configure PAT"}
                       </button>
-                    </div>
-                  )}
+                    ) : (
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={handleLogin}
+                          className="px-3.5 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-xs font-semibold text-white transition-colors flex items-center gap-1.5 shadow-sm"
+                        >
+                          <Github className="w-3.5 h-3.5" />
+                          Sign in
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleDevLogin}
+                          className="px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-xs font-medium text-gray-300 border border-gray-700 transition-colors"
+                          title="Local Dev Login"
+                        >
+                          Dev Login
+                        </button>
+                        <input
+                          type="password"
+                          placeholder="ghp_xxxxxxxxxxxx"
+                          value={githubToken}
+                          onChange={(e) => setGithubToken(e.target.value)}
+                          className="px-3 py-1.5 rounded-lg bg-gray-950 border border-gray-700 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 w-48 font-mono"
+                        />
+                        <button
+                          onClick={handleConnectGitHub}
+                          disabled={connectingGithub}
+                          className="px-3.5 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-xs font-medium text-white border border-gray-700 transition-colors disabled:opacity-50"
+                        >
+                          {connectingGithub ? "Saving..." : "Save PAT"}
+                        </button>
+                      </div>
+                    )}
+                  </div>
                 </div>
 
                 {githubError && (
@@ -412,18 +629,17 @@ export default function WorkspacePage() {
                         Repositories ({repositories.length})
                       </h3>
                     </div>
-                    {githubToken && (
-                      <button
-                        onClick={() => loadRepositories(githubToken)}
-                        disabled={loadingRepos}
-                        className="text-gray-400 hover:text-white"
-                      >
-                        <RefreshCw className={`w-3.5 h-3.5 ${loadingRepos ? "animate-spin" : ""}`} />
-                      </button>
-                    )}
+                    <button
+                      onClick={() => loadRepositories()}
+                      disabled={loadingRepos}
+                      className="text-gray-400 hover:text-white"
+                      title="Refresh repositories"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${loadingRepos ? "animate-spin" : ""}`} />
+                    </button>
                   </div>
 
-                  {githubUser ? (
+                  {(user || githubUser || repositories.length > 0) ? (
                     <div className="space-y-3">
                       <div className="relative">
                         <Search className="w-3.5 h-3.5 absolute left-3 top-2.5 text-gray-500" />
@@ -886,7 +1102,7 @@ export default function WorkspacePage() {
                         </div>
 
                         {/* Persistent Approvals List */}
-                        {currentTask.approvals.length > 0 && (
+                        {currentTask.approvals && currentTask.approvals.length > 0 && (
                           <div className="p-3 rounded-lg bg-gray-950/80 border border-gray-800 space-y-1.5 text-xs">
                             <span className="font-semibold text-gray-400 text-[11px] uppercase">Recorded Review Decisions:</span>
                             {currentTask.approvals.map((appr) => (
@@ -1009,6 +1225,16 @@ export default function WorkspacePage() {
                             </button>
                           ) : (
                             <>
+                              {canResume && (
+                                <button
+                                  onClick={handleResumePlan}
+                                  disabled={executingPlan}
+                                  className="px-4 py-2.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold text-white transition-all shadow-lg shadow-emerald-950/40 flex items-center gap-2 disabled:opacity-40"
+                                >
+                                  <RefreshCw className="w-3.5 h-3.5" />
+                                  Resume Interrupted Plan
+                                </button>
+                              )}
                               <button
                                 onClick={handleExecutePlan}
                                 disabled={executingPlan || ["AWAITING_QA","AWAITING_REVIEW","AWAITING_DELIVERY","CLOSED"].includes(executionStatus?.status || "")}

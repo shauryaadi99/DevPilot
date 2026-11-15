@@ -32,6 +32,7 @@ from app.agents.schemas import (
     ImplementationStep,
 )
 from app.core.logging import logger
+from app.api.v1.auth import get_optional_current_user
 
 router = APIRouter(prefix="/api/v1/tasks", tags=["Tasks & Planning"])
 
@@ -47,15 +48,39 @@ class ApprovalRequest(BaseModel):
     feedback: Optional[str] = None
 
 
+def _task_to_summary_dict(task: Task) -> dict:
+    return {
+        "id": task.id,
+        "repository_id": task.repository_id,
+        "user_id": task.user_id,
+        "title": task.title,
+        "requirement": task.user_requirement,
+        "status": task.status,
+        "created_at": task.created_at.isoformat() if task.created_at else None,
+        "updated_at": task.updated_at.isoformat() if task.updated_at else None,
+    }
+
+
 @router.post("", summary="Create a New Task")
-def create_task(payload: CreateTaskRequest, db: Session = Depends(get_db)):
+def create_task(
+    payload: CreateTaskRequest,
+    auth_context: Optional[tuple] = Depends(get_optional_current_user),
+    db: Session = Depends(get_db),
+):
     """Submit a natural-language engineering requirement for a connected repository."""
     repo = db.query(Repository).filter(Repository.id == payload.repository_id).first()
     if not repo:
         raise HTTPException(status_code=404, detail="Target repository not found.")
 
+    user_id = None
+    session = None
+    if auth_context:
+        user, session, _ = auth_context
+        user_id = user.id
+
     task = Task(
         repository_id=repo.id,
+        user_id=user_id,
         title=payload.title.strip(),
         user_requirement=payload.requirement.strip(),
         status="PENDING",
@@ -63,14 +88,19 @@ def create_task(payload: CreateTaskRequest, db: Session = Depends(get_db)):
     db.add(task)
     db.commit()
     db.refresh(task)
-    return task
+
+    if session:
+        session.active_task_id = task.id
+        db.commit()
+
+    return _task_to_summary_dict(task)
 
 
 @router.get("", summary="List All Tasks")
 def list_tasks(limit: int = 20, db: Session = Depends(get_db)):
     """List recent engineering tasks."""
     tasks = db.query(Task).order_by(Task.created_at.desc()).limit(limit).all()
-    return tasks
+    return [_task_to_summary_dict(t) for t in tasks]
 
 
 @router.get("/{task_id}", summary="Get Full Task Details")
@@ -208,7 +238,6 @@ async def run_task_pipeline(
             acceptance_criteria=analysis_output.acceptance_criteria,
             ambiguities=analysis_output.ambiguities,
             clarification_questions=analysis_output.clarification_questions,
-            raw_llm_response=analysis_output.model_dump(),
         )
         db.add(req_record)
 
@@ -238,7 +267,6 @@ async def run_task_pipeline(
             dependencies=plan_output.dependencies,
             testing_strategy=plan_output.testing_strategy,
             risks_and_assumptions=plan_output.risks_and_assumptions,
-            raw_llm_response=plan_output.model_dump(),
         )
         db.add(plan_record)
 
@@ -339,7 +367,6 @@ async def record_plan_approval(
             task.requirement_analysis.acceptance_criteria = revised_analysis.acceptance_criteria
             task.requirement_analysis.ambiguities = revised_analysis.ambiguities
             task.requirement_analysis.clarification_questions = revised_analysis.clarification_questions
-            task.requirement_analysis.raw_llm_response = revised_analysis.model_dump()
 
         # 2. Revise Architect Plan with feedback
         architect_agent = ArchitectAgent()
@@ -376,7 +403,6 @@ async def record_plan_approval(
         task.implementation_plan.dependencies = revised_plan.dependencies
         task.implementation_plan.testing_strategy = revised_plan.testing_strategy
         task.implementation_plan.risks_and_assumptions = revised_plan.risks_and_assumptions
-        task.implementation_plan.raw_llm_response = revised_plan.model_dump()
 
         # Transition task back to AWAITING_APPROVAL with revised plan
         task.status = "AWAITING_APPROVAL"
@@ -419,6 +445,7 @@ async def execute_plan(
     task_id: str,
     payload: ExecuteRequest,
     background_tasks: BackgroundTasks,
+    auth_context: Optional[tuple] = Depends(get_optional_current_user),
     db: Session = Depends(get_db),
 ):
     """Start autonomous execution of an APPROVED implementation plan.
@@ -431,6 +458,13 @@ async def execute_plan(
     Returns 403 if any check fails.
     """
     task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+
+    token = payload.github_token
+    if not token and auth_context:
+        _, _, decrypted_pat = auth_context
+        token = decrypted_pat
     if not task:
         raise HTTPException(status_code=404, detail="Task not found.")
 
@@ -482,7 +516,7 @@ async def execute_plan(
         db=db,
         task=task,
         execution=execution,
-        github_token=payload.github_token,
+        github_token=token,
     )
 
     return {
@@ -490,6 +524,52 @@ async def execute_plan(
         "execution_id": execution.id,
         "task_id": task_id,
         "message": "Execution started in background. Poll GET /{task_id}/execution for status.",
+    }
+
+
+@router.post("/{task_id}/resume", summary="Resume Interrupted Execution (Chapter 3)")
+async def resume_task_execution(
+    task_id: str,
+    background_tasks: BackgroundTasks,
+    auth_context: Optional[tuple] = Depends(get_optional_current_user),
+    db: Session = Depends(get_db),
+):
+    """Resume an interrupted execution without repeating completed steps or approvals."""
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+
+    execution = (
+        db.query(TaskExecution)
+        .filter(TaskExecution.task_id == task_id)
+        .order_by(TaskExecution.started_at.desc())
+        .first()
+    )
+    if not execution:
+        raise HTTPException(status_code=404, detail="No execution found to resume.")
+
+    if execution.status in ("AWAITING_QA", "AWAITING_REVIEW", "AWAITING_DELIVERY", "CLOSED"):
+        raise HTTPException(status_code=409, detail=f"Execution is already in completed state: {execution.status}")
+
+    token = None
+    if auth_context:
+        _, _, decrypted_pat = auth_context
+        token = decrypted_pat
+
+    service = ExecutionService()
+    background_tasks.add_task(
+        service.resume_plan,
+        db=db,
+        task=task,
+        execution=execution,
+        github_token=token,
+    )
+
+    return {
+        "status": "resuming",
+        "execution_id": execution.id,
+        "task_id": task_id,
+        "message": "Resumed execution from last checkpoint in background.",
     }
 
 
