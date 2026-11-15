@@ -74,27 +74,6 @@ def get_optional_current_user(
     """Optionally resolve user/session without raising 401."""
     token = devpilot_session_id or x_session_id
     if not token:
-        # Check if single default user exists in local development
-        user = db.query(User).first()
-        if user:
-            # Check or create dev session
-            session = db.query(UserSession).filter(UserSession.user_id == user.id).first()
-            if not session:
-                session = UserSession(
-                    id=generate_session_token(),
-                    user_id=user.id,
-                    expires_at=datetime.now(timezone.utc) + timedelta(days=7),
-                )
-                db.add(session)
-                db.commit()
-                db.refresh(session)
-            decrypted_pat = None
-            if user.credential and user.credential.is_valid:
-                try:
-                    decrypted_pat = decrypt_pat(user.credential.encrypted_pat)
-                except Exception:
-                    pass
-            return user, session, decrypted_pat
         return None
 
     try:
@@ -441,13 +420,14 @@ async def get_pat_status(
 @router.post("/logout", summary="Logout and Clear Session")
 def logout(
     response: Response,
-    context: tuple = Depends(get_current_user_and_session),
+    context: Optional[tuple] = Depends(get_optional_current_user),
     db: Session = Depends(get_db),
 ):
     """End the current user session and clear browser cookie."""
-    _, session, _ = context
-    db.delete(session)
-    db.commit()
+    if context:
+        _, session, _ = context
+        db.delete(session)
+        db.commit()
 
-    response.delete_cookie("devpilot_session_id")
+    response.delete_cookie("devpilot_session_id", path="/")
     return {"status": "logged_out", "message": "Successfully logged out."}

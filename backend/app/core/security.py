@@ -55,3 +55,4 @@ def mask_pat(pat: str) -> str:
 def generate_session_token() -> str:
     """Generate a high-entropy URL-safe session token for HTTP-only cookies."""
     return secrets.token_urlsafe(32)
+

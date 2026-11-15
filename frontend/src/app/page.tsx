@@ -227,9 +227,9 @@ export default function WorkspacePage() {
         return;
       }
     } catch {
-      // Fallback to dev login if GitHub OAuth credentials not configured
+      // GitHub OAuth credentials not configured; prompt with PAT modal for GitHub auth
     }
-    handleDevLogin();
+    setIsPatModalOpen(true);
   };
 
   const handleDevLogin = async () => {
@@ -279,31 +279,10 @@ export default function WorkspacePage() {
     try {
       setConnectingGithub(true);
       setGithubError(null);
-      const res = await submitPat(githubToken.trim());
-      setPatStatus({
-        has_pat: true,
-        is_valid: true,
-        pat_masked: res.pat_masked,
-        scopes: res.scopes || [],
-        last_validated_at: new Date().toISOString(),
-      });
-      if (res.user) {
-        setGithubUser({
-          login: res.user.login,
-          name: res.user.name,
-          avatar_url: res.user.avatar_url,
-          html_url: `https://github.com/${res.user.login}`,
-          public_repos: 0,
-        });
-        setUser({
-          id: res.user.login,
-          username: res.user.login,
-          name: res.user.name,
-          avatar_url: res.user.avatar_url,
-        });
-      }
+      await submitPat(githubToken.trim());
       setGithubToken("");
-      loadRepositories();
+      await initSession();
+      await loadRepositories();
     } catch (err: any) {
       setGithubError(err?.message || "GitHub authentication failed.");
     } finally {
@@ -500,9 +479,10 @@ export default function WorkspacePage() {
         isOpen={isPatModalOpen}
         patStatus={patStatus}
         onClose={() => setIsPatModalOpen(false)}
-        onSaved={(newStatus) => {
+        onSaved={async (newStatus) => {
           setPatStatus(newStatus);
-          loadRepositories();
+          await initSession();
+          await loadRepositories();
         }}
       />
 
