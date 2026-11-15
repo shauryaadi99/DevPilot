@@ -18,6 +18,8 @@ from app.db.models import (
     ImplementationPlan,
     PlanApproval,
     TaskExecution,
+    QAReport,
+    CodeReviewReport,
 )
 from app.integrations.github_client import GitHubClient, GitHubError
 from app.services.inspection_service import InspectionService
@@ -649,7 +651,7 @@ async def resume_task_execution(
     if not execution:
         raise HTTPException(status_code=404, detail="No execution found to resume.")
 
-    if execution.status in ("AWAITING_QA", "AWAITING_REVIEW", "AWAITING_DELIVERY", "CLOSED"):
+    if execution.status in ("AWAITING_REVIEW", "AWAITING_DELIVERY", "CLOSED"):
         raise HTTPException(status_code=409, detail=f"Execution is already in completed state: {execution.status}")
 
     token = None
@@ -671,6 +673,56 @@ async def resume_task_execution(
         "execution_id": execution.id,
         "task_id": task_id,
         "message": "Resumed execution from last checkpoint in background.",
+    }
+
+
+@router.post("/{task_id}/run-qa", summary="Trigger QA & Code Review (Chapter 4)")
+async def run_qa(
+    task_id: str,
+    background_tasks: BackgroundTasks,
+    auth_context: Optional[tuple] = Depends(get_optional_current_user),
+    db: Session = Depends(get_db),
+):
+    """Trigger QA testing and Code Review for a task with committed changes."""
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+
+    execution = (
+        db.query(TaskExecution)
+        .filter(TaskExecution.task_id == task_id)
+        .order_by(TaskExecution.started_at.desc())
+        .first()
+    )
+    if not execution:
+        raise HTTPException(status_code=404, detail="No execution found for this task.")
+
+    if execution.status in ("CLONING", "EXECUTING", "COMMITTING"):
+        raise HTTPException(status_code=409, detail=f"Execution is currently in progress ({execution.status}).")
+
+    token = None
+    if auth_context:
+        _, _, decrypted_pat = auth_context
+        token = decrypted_pat
+
+    execution.status = "QA_TESTING"
+    task.status = "EXECUTING"
+    db.commit()
+
+    service = ExecutionService()
+    background_tasks.add_task(
+        service.resume_plan,
+        db=db,
+        task=task,
+        execution=execution,
+        github_token=token,
+    )
+
+    return {
+        "status": "started",
+        "execution_id": execution.id,
+        "task_id": task_id,
+        "message": "QA testing and Code Review started in background.",
     }
 
 
@@ -720,6 +772,41 @@ def get_execution_status(task_id: str, db: Session = Depends(get_db)):
                 "timestamp": log.timestamp.isoformat(),
             }
             for log in execution.logs
+        ],
+        "qa_reports": [
+            {
+                "id": qr.id,
+                "cycle_number": qr.cycle_number,
+                "overall_passed": qr.overall_passed,
+                "commands_executed": qr.commands_executed,
+                "tests_passed": qr.tests_passed,
+                "tests_failed": qr.tests_failed,
+                "tests_skipped": qr.tests_skipped,
+                "exit_codes": qr.exit_codes,
+                "logs": qr.logs,
+                "failure_summary": qr.failure_summary,
+                "failure_signature": qr.failure_signature,
+                "test_details": qr.test_details,
+                "acceptance_criteria_results": qr.acceptance_criteria_results,
+                "actionable_feedback": qr.actionable_feedback,
+                "created_at": qr.created_at.isoformat(),
+            }
+            for qr in execution.qa_reports
+        ],
+        "review_reports": [
+            {
+                "id": rr.id,
+                "cycle_number": rr.cycle_number,
+                "outcome": rr.outcome,
+                "summary": rr.summary,
+                "correctness_assessment": rr.correctness_assessment,
+                "security_assessment": rr.security_assessment,
+                "quality_score": rr.quality_score,
+                "issues": rr.issues,
+                "approval_recommendation": rr.approval_recommendation,
+                "created_at": rr.created_at.isoformat(),
+            }
+            for rr in execution.review_reports
         ],
     }
 
@@ -808,3 +895,81 @@ def close_task(task_id: str, db: Session = Depends(get_db)):
         "message": "Task closed. Workspace has been released." if removed
                    else "Task closed. Workspace removal failed — check logs.",
     }
+
+
+@router.get("/{task_id}/qa-reports", summary="Get QA Test Reports (Chapter 4)")
+def get_qa_reports(task_id: str, db: Session = Depends(get_db)):
+    """Retrieve all QA Engineer test execution reports for a task."""
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+
+    reports = (
+        db.query(QAReport)
+        .filter(QAReport.task_id == task_id)
+        .order_by(QAReport.cycle_number.asc(), QAReport.created_at.asc())
+        .all()
+    )
+
+    return {
+        "task_id": task_id,
+        "total_cycles": len(reports),
+        "reports": [
+            {
+                "id": r.id,
+                "execution_id": r.execution_id,
+                "cycle_number": r.cycle_number,
+                "overall_passed": r.overall_passed,
+                "commands_executed": r.commands_executed,
+                "tests_passed": r.tests_passed,
+                "tests_failed": r.tests_failed,
+                "tests_skipped": r.tests_skipped,
+                "exit_codes": r.exit_codes,
+                "logs": r.logs,
+                "failure_summary": r.failure_summary,
+                "failure_signature": r.failure_signature,
+                "test_details": r.test_details,
+                "acceptance_criteria_results": r.acceptance_criteria_results,
+                "actionable_feedback": r.actionable_feedback,
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in reports
+        ],
+    }
+
+
+@router.get("/{task_id}/review-reports", summary="Get Code Review Reports (Chapter 4)")
+def get_review_reports(task_id: str, db: Session = Depends(get_db)):
+    """Retrieve all Code Reviewer reports for a task."""
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+
+    reports = (
+        db.query(CodeReviewReport)
+        .filter(CodeReviewReport.task_id == task_id)
+        .order_by(CodeReviewReport.cycle_number.asc(), CodeReviewReport.created_at.asc())
+        .all()
+    )
+
+    return {
+        "task_id": task_id,
+        "total_reviews": len(reports),
+        "reports": [
+            {
+                "id": r.id,
+                "execution_id": r.execution_id,
+                "cycle_number": r.cycle_number,
+                "outcome": r.outcome,
+                "summary": r.summary,
+                "correctness_assessment": r.correctness_assessment,
+                "security_assessment": r.security_assessment,
+                "quality_score": r.quality_score,
+                "issues": r.issues,
+                "approval_recommendation": r.approval_recommendation,
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in reports
+        ],
+    }
+

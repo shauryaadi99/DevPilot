@@ -143,6 +143,36 @@ class GroqProvider:
                 "message": "An unexpected error occurred while contacting Groq.",
             }
 
+    async def chat_completion(
+        self,
+        messages: list[dict[str, str]],
+        model: Optional[str] = None,
+        temperature: float = 0.2,
+        response_format: Optional[dict[str, str]] = None,
+        max_tokens: Optional[int] = None,
+    ) -> Any:
+        """Async-compatible chat completion wrapper using asyncio.to_thread."""
+        import asyncio
+        client = self._get_client()
+        kwargs: dict[str, Any] = {
+            "model": model or self.model,
+            "messages": messages,
+            "temperature": temperature,
+        }
+        if response_format:
+            kwargs["response_format"] = response_format
+        if max_tokens:
+            kwargs["max_tokens"] = max_tokens
+
+        res = await asyncio.to_thread(client.chat.completions.create, **kwargs)
+
+        class ChatResult:
+            def __init__(self, content: str):
+                self.content = content
+
+        choice_text = res.choices[0].message.content if res.choices else ""
+        return ChatResult(content=choice_text)
+
 
 _groq_provider_instance: Optional[GroqProvider] = None
 

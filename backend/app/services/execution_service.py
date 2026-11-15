@@ -1,15 +1,21 @@
-"""Execution orchestration service for Chapter 3.
+"""Execution orchestration service for Chapters 3 & 4.
 
 Uses LangGraph StateGraph with PostgreSQL checkpointing (PostgresSaver) to manage
-the autonomous execution pipeline:
-VALIDATING → CLONING → EXECUTING → COMMITTING → AWAITING_QA / FAILED / CANCELLED
+the autonomous engineering pipeline:
+VALIDATING → CLONING → EXECUTING → COMMITTING → QA_TESTING ⇄ EXECUTING → REVIEWING ⇄ EXECUTING → AWAITING_DELIVERY
 
 Includes:
 - Distributed execution locking (ExecutionLock) to prevent duplicate parallel runs
 - Idempotent step-level execution (skips already applied steps on resume)
 - Commit idempotency (reuses existing commit SHA if working tree already committed)
 - Persistent workspace preservation (never auto-deletes workspaces on completion)
+- QA Engineer Agent execution with bounded retry loops (default max 3)
+- Repeated-failure detection (escalates early on identical failure signatures)
+- Independent Code Reviewer Agent with outcome evaluation (APPROVED, CHANGES_REQUESTED, BLOCKED)
+- Delivery state progression (AWAITING_DELIVERY) ready for Chapter 5 GitHub PR
 """
+
+from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
@@ -20,15 +26,25 @@ import uuid
 from sqlalchemy.orm import Session
 from git import Repo
 
+from app.agents.code_reviewer import CodeReviewerAgent
 from app.agents.developer import DeveloperAgent, DeveloperResult
+from app.agents.qa_engineer import QAEngineerAgent
 from app.agents.schemas import ArchitectPlanOutput, FileToCreate, FileToModify, ImplementationStep
 from app.core.config import get_settings
 from app.core.logging import logger
-from app.db.models import FileChange, ExecutionLog, ExecutionLock, Task, TaskExecution
+from app.db.models import (
+    CodeReviewReport,
+    ExecutionLock,
+    ExecutionLog,
+    FileChange,
+    QAReport,
+    Task,
+    TaskExecution,
+)
 from app.services.git_service import (
+    get_workspace_path,
     prepare_task_workspace,
     stage_and_commit,
-    get_workspace_path,
 )
 
 try:
@@ -110,11 +126,9 @@ def acquire_execution_lock(db: Session, task_id: str, execution_id: str) -> Opti
     lock = db.query(ExecutionLock).filter(ExecutionLock.task_id == task_id).first()
 
     if lock:
-        # Check if lock is still active and fresh (< 60s)
         if lock.expires_at > now:
             logger.warning(f"Task {task_id} is locked by execution {lock.execution_id}")
             return None
-        # Stale/crashed lock — reclaim it
         logger.info(f"Reclaiming stale lock on task {task_id}")
         token = str(uuid.uuid4())
         lock.execution_id = execution_id
@@ -161,9 +175,21 @@ class ExecutionState(TypedDict):
     branch_name: Optional[str]
     developer_result: Optional[Dict[str, Any]]
     commit_sha: Optional[str]
-    status: str  # VALIDATING, CLONING, EXECUTING, COMMITTING, AWAITING_QA, FAILED, CANCELLED
+    status: str
     error_message: Optional[str]
     completed_steps: Optional[List[int]]
+    user_requirement: Optional[str]
+    acceptance_criteria: Optional[List[str]]
+    qa_cycle: int
+    max_qa_cycles: int
+    review_cycle: int
+    max_review_cycles: int
+    qa_result: Optional[Dict[str, Any]]
+    review_result: Optional[Dict[str, Any]]
+    failure_history: Optional[List[str]]
+    feedback_for_developer: Optional[str]
+    qa_reports_data: Optional[List[Dict[str, Any]]]
+    review_reports_data: Optional[List[Dict[str, Any]]]
 
 
 # ── Node Implementations ─────────────────────────────────────────────────────
@@ -198,10 +224,12 @@ async def node_clone(state: ExecutionState) -> ExecutionState:
 
 
 async def node_execute(state: ExecutionState) -> ExecutionState:
-    """Run Developer Agent on approved plan with step-level idempotency."""
+    """Run Developer Agent on approved plan with step-level idempotency and optional feedback."""
     task_id = state["task_id"]
     workspace = Path(state["workspace_path"])
-    logger.info(f"[{task_id}] Starting Developer Agent execution")
+    feedback = state.get("feedback_for_developer")
+    mode_desc = f"with feedback: {feedback[:80]}..." if feedback else "initial implementation"
+    logger.info(f"[{task_id}] Starting Developer Agent execution ({mode_desc})")
 
     plan_dict = state["plan"]
     try:
@@ -219,13 +247,15 @@ async def node_execute(state: ExecutionState) -> ExecutionState:
     except Exception as exc:
         return {**state, "status": "FAILED", "error_message": f"Plan reconstruction failed: {exc}"}
 
-    completed_set = set(state.get("completed_steps") or [])
+    # If in retry mode with feedback, do not skip steps based on prior cache
+    completed_set = set() if feedback else set(state.get("completed_steps") or [])
 
     agent = DeveloperAgent()
     result = await agent.implement(
         plan=plan,
         workspace_path=workspace,
         completed_step_numbers=completed_set,
+        feedback=feedback,
     )
 
     result_dict = {
@@ -251,9 +281,18 @@ async def node_execute(state: ExecutionState) -> ExecutionState:
     }
 
     if not result.success:
-        return {**state, "status": "FAILED", "developer_result": result_dict,
-                "error_message": result.error_message}
-    return {**state, "status": "COMMITTING", "developer_result": result_dict}
+        return {
+            **state,
+            "status": "FAILED",
+            "developer_result": result_dict,
+            "error_message": result.error_message,
+        }
+    return {
+        **state,
+        "status": "COMMITTING",
+        "developer_result": result_dict,
+        "feedback_for_developer": None,  # Consumed
+    }
 
 
 async def node_commit(state: ExecutionState) -> ExecutionState:
@@ -264,7 +303,6 @@ async def node_commit(state: ExecutionState) -> ExecutionState:
 
     def _do_commit():
         repo = Repo(str(workspace))
-        # If already committed in a prior run and working tree is clean:
         if not repo.is_dirty(untracked_files=True):
             if repo.head.is_valid():
                 commit_msg = repo.head.commit.message
@@ -276,11 +314,200 @@ async def node_commit(state: ExecutionState) -> ExecutionState:
 
     try:
         sha = await asyncio.get_event_loop().run_in_executor(None, _do_commit)
-        return {**state, "status": "AWAITING_QA", "commit_sha": sha}
+        return {**state, "status": "QA_TESTING", "commit_sha": sha}
     except RuntimeError as exc:
         if "Nothing to commit" in str(exc):
-            return {**state, "status": "AWAITING_QA", "commit_sha": None}
+            return {**state, "status": "QA_TESTING", "commit_sha": state.get("commit_sha")}
         return {**state, "status": "FAILED", "error_message": str(exc)}
+
+
+async def node_qa(state: ExecutionState) -> ExecutionState:
+    """Run QA Engineer Agent tests within the isolated workspace."""
+    task_id = state["task_id"]
+    workspace = Path(state["workspace_path"])
+    qa_cycle = (state.get("qa_cycle") or 0) + 1
+    logger.info(f"[{task_id}] Starting QA cycle {qa_cycle}")
+
+    plan_data = state.get("plan")
+    plan_obj = None
+    if plan_data:
+        try:
+            plan_obj = ArchitectPlanOutput(**plan_data)
+        except Exception:
+            pass
+
+    qa_agent = QAEngineerAgent()
+    prev_sig = (state.get("failure_history") or [])[-1] if state.get("failure_history") else None
+
+    qa_output = await qa_agent.execute_and_evaluate(
+        workspace_path=workspace,
+        acceptance_criteria=state.get("acceptance_criteria") or [],
+        plan=plan_obj,
+        previous_failure_signature=prev_sig,
+    )
+
+    qa_dict = qa_output.model_dump()
+    qa_reports_data = list(state.get("qa_reports_data") or [])
+    qa_reports_data.append({**qa_dict, "cycle_number": qa_cycle})
+
+    new_failure_history = list(state.get("failure_history") or [])
+    if qa_output.failure_signature:
+        new_failure_history.append(qa_output.failure_signature)
+
+    return {
+        **state,
+        "qa_cycle": qa_cycle,
+        "qa_result": qa_dict,
+        "qa_reports_data": qa_reports_data,
+        "failure_history": new_failure_history,
+        "status": "QA_EVALUATING",
+    }
+
+
+def route_qa(state: ExecutionState) -> str:
+    """Route based on QA results: PASS -> Review; FAIL -> Check stall / limit -> Retry or Fail."""
+    qa_res = state.get("qa_result") or {}
+    if qa_res.get("overall_passed"):
+        logger.info(f"[{state['task_id']}] QA passed on cycle {state.get('qa_cycle')}. Advancing to code review.")
+        return "REVIEWING"
+
+    # Repeated failure stall detection: if the last 2 signatures match and are not None
+    history = state.get("failure_history") or []
+    if len(history) >= 2 and history[-1] == history[-2] and history[-1] is not None:
+        logger.warning(f"[{state['task_id']}] Repeated failure stall detected (signature: {history[-1]}). Halting early.")
+        return "FAILED_STALLED"
+
+    # Retry limit check
+    current_cycle = state.get("qa_cycle", 1)
+    max_cycles = state.get("max_qa_cycles", 3)
+    if current_cycle >= max_cycles:
+        logger.warning(f"[{state['task_id']}] QA retry limit exhausted ({current_cycle}/{max_cycles}).")
+        return "FAILED_EXHAUSTED"
+
+    logger.info(f"[{state['task_id']}] QA failed. Looping back to Developer Agent (cycle {current_cycle + 1}/{max_cycles}).")
+    return "RETRY_DEVELOPER"
+
+
+def node_qa_stalled(state: ExecutionState) -> ExecutionState:
+    sig = (state.get("failure_history") or ["unknown"])[-1]
+    return {
+        **state,
+        "status": "FAILED",
+        "error_message": f"Execution halted: repeated identical failure signature '{sig}' detected across consecutive cycles without progress.",
+    }
+
+
+def node_qa_exhausted(state: ExecutionState) -> ExecutionState:
+    cycles = state.get("qa_cycle", 3)
+    return {
+        **state,
+        "status": "FAILED",
+        "error_message": f"Execution halted: QA retry limit exhausted after {cycles} cycles without passing all tests.",
+    }
+
+
+def node_prepare_dev_retry(state: ExecutionState) -> ExecutionState:
+    qa_res = state.get("qa_result") or {}
+    feedback = qa_res.get("actionable_feedback") or qa_res.get("failure_summary") or "Fix failing tests."
+    return {
+        **state,
+        "status": "EXECUTING",
+        "feedback_for_developer": feedback,
+    }
+
+
+async def node_review(state: ExecutionState) -> ExecutionState:
+    """Run Code Reviewer Agent on Git diff against base branch."""
+    task_id = state["task_id"]
+    workspace = Path(state["workspace_path"])
+    review_cycle = (state.get("review_cycle") or 0) + 1
+    logger.info(f"[{task_id}] Starting Code Review cycle {review_cycle}")
+
+    reviewer = CodeReviewerAgent()
+    plan_dict = state.get("plan") or {}
+    plan_summary = plan_dict.get("summary", "")
+    qa_summary = (state.get("qa_result") or {}).get("failure_summary") or "All automated tests verified and passing."
+
+    review_output = await reviewer.review(
+        workspace_path=workspace,
+        task_requirement=state.get("user_requirement") or "Implement task cleanly.",
+        plan_summary=plan_summary,
+        qa_summary=qa_summary,
+    )
+
+    review_dict = review_output.model_dump()
+    review_reports_data = list(state.get("review_reports_data") or [])
+    review_reports_data.append({**review_dict, "cycle_number": review_cycle})
+
+    return {
+        **state,
+        "review_cycle": review_cycle,
+        "review_result": review_dict,
+        "review_reports_data": review_reports_data,
+        "status": "REVIEW_EVALUATING",
+    }
+
+
+def route_review(state: ExecutionState) -> str:
+    """Route based on Code Review outcome: APPROVED -> Delivery; BLOCKED -> Fail; CHANGES -> Retry."""
+    review_res = state.get("review_result") or {}
+    outcome = review_res.get("outcome", "APPROVED").upper()
+
+    if outcome == "APPROVED":
+        logger.info(f"[{state['task_id']}] Code Review APPROVED. Task ready for delivery.")
+        return "AWAITING_DELIVERY"
+
+    if outcome == "BLOCKED":
+        logger.warning(f"[{state['task_id']}] Code Review BLOCKED due to critical issues.")
+        return "FAILED_BLOCKED"
+
+    # CHANGES_REQUESTED
+    current_cycle = state.get("review_cycle", 1)
+    max_cycles = state.get("max_review_cycles", 2)
+    if current_cycle >= max_cycles:
+        logger.warning(f"[{state['task_id']}] Review change requests retry limit exhausted ({current_cycle}/{max_cycles}).")
+        return "FAILED_EXHAUSTED"
+
+    logger.info(f"[{state['task_id']}] Changes requested by reviewer. Looping back to Developer Agent.")
+    return "RETRY_DEVELOPER"
+
+
+def node_review_blocked(state: ExecutionState) -> ExecutionState:
+    review_res = state.get("review_result") or {}
+    return {
+        **state,
+        "status": "FAILED",
+        "error_message": f"Execution halted: Code Review BLOCKED. {review_res.get('summary', 'Critical issues detected.')}",
+    }
+
+
+def node_review_exhausted(state: ExecutionState) -> ExecutionState:
+    cycles = state.get("review_cycle", 2)
+    return {
+        **state,
+        "status": "FAILED",
+        "error_message": f"Execution halted: Review change requests exceeded maximum allowable cycles ({cycles}).",
+    }
+
+
+def node_prepare_review_retry(state: ExecutionState) -> ExecutionState:
+    review_res = state.get("review_result") or {}
+    issues_str = "\n".join(
+        f"- [{i.get('severity')}] {i.get('file_path')}: {i.get('description')} (Fix: {i.get('suggested_fix')})"
+        for i in review_res.get("issues", [])
+    )
+    feedback = f"Reviewer Changes Requested: {review_res.get('summary')}\nIssues:\n{issues_str}"
+    return {
+        **state,
+        "status": "EXECUTING",
+        "feedback_for_developer": feedback,
+    }
+
+
+def node_delivery(state: ExecutionState) -> ExecutionState:
+    """Final delivery node marking task verified and awaiting Chapter 5 GitHub PR."""
+    logger.info(f"[{state['task_id']}] All Chapter 4 checks passed. Task transitioning to AWAITING_DELIVERY.")
+    return {**state, "status": "AWAITING_DELIVERY"}
 
 
 def _route(state: ExecutionState) -> str:
@@ -297,6 +524,15 @@ def build_execution_graph(checkpointer=None):
     graph.add_node("CLONING", node_clone)
     graph.add_node("EXECUTING", node_execute)
     graph.add_node("COMMITTING", node_commit)
+    graph.add_node("QA_TESTING", node_qa)
+    graph.add_node("QA_FAIL_STALLED", node_qa_stalled)
+    graph.add_node("QA_FAIL_EXHAUSTED", node_qa_exhausted)
+    graph.add_node("QA_RETRY_DEV", node_prepare_dev_retry)
+    graph.add_node("REVIEWING", node_review)
+    graph.add_node("REVIEW_FAIL_BLOCKED", node_review_blocked)
+    graph.add_node("REVIEW_FAIL_EXHAUSTED", node_review_exhausted)
+    graph.add_node("REVIEW_RETRY_DEV", node_prepare_review_retry)
+    graph.add_node("DELIVERY", node_delivery)
 
     graph.set_entry_point("VALIDATING")
 
@@ -313,9 +549,29 @@ def build_execution_graph(checkpointer=None):
         "FAILED": END,
     })
     graph.add_conditional_edges("COMMITTING", _route, {
-        "AWAITING_QA": END,
+        "QA_TESTING": "QA_TESTING",
         "FAILED": END,
     })
+    graph.add_conditional_edges("QA_TESTING", route_qa, {
+        "REVIEWING": "REVIEWING",
+        "FAILED_STALLED": "QA_FAIL_STALLED",
+        "FAILED_EXHAUSTED": "QA_FAIL_EXHAUSTED",
+        "RETRY_DEVELOPER": "QA_RETRY_DEV",
+    })
+    graph.add_edge("QA_FAIL_STALLED", END)
+    graph.add_edge("QA_FAIL_EXHAUSTED", END)
+    graph.add_edge("QA_RETRY_DEV", "EXECUTING")
+
+    graph.add_conditional_edges("REVIEWING", route_review, {
+        "AWAITING_DELIVERY": "DELIVERY",
+        "FAILED_BLOCKED": "REVIEW_FAIL_BLOCKED",
+        "FAILED_EXHAUSTED": "REVIEW_FAIL_EXHAUSTED",
+        "RETRY_DEVELOPER": "REVIEW_RETRY_DEV",
+    })
+    graph.add_edge("REVIEW_FAIL_BLOCKED", END)
+    graph.add_edge("REVIEW_FAIL_EXHAUSTED", END)
+    graph.add_edge("REVIEW_RETRY_DEV", "EXECUTING")
+    graph.add_edge("DELIVERY", END)
 
     if checkpointer:
         return graph.compile(checkpointer=checkpointer)
@@ -326,7 +582,7 @@ def build_execution_graph(checkpointer=None):
 
 
 class ExecutionService:
-    """Orchestrates plan execution, checkpointing, and DB persistence."""
+    """Orchestrates plan execution, QA, review, checkpointing, and DB persistence."""
 
     def __init__(self):
         self._checkpointer = _get_postgres_saver()
@@ -344,7 +600,6 @@ class ExecutionService:
         github_token: Optional[str] = None,
     ) -> None:
         """Run execution pipeline with locking and checkpoint recovery."""
-        # 1. Acquire execution lock
         lock_token = acquire_execution_lock(db, task.id, execution.id)
         if not lock_token:
             execution.status = "FAILED"
@@ -357,6 +612,10 @@ class ExecutionService:
         if task.implementation_plan:
             plan_data = task.implementation_plan.__dict__.copy()
             plan_data.pop("_sa_instance_state", None)
+
+        criteria: List[str] = []
+        if task.requirement_analysis and task.requirement_analysis.acceptance_criteria:
+            criteria = list(task.requirement_analysis.acceptance_criteria)
 
         initial_state: ExecutionState = {
             "task_id": task.id,
@@ -372,6 +631,18 @@ class ExecutionService:
             "status": "VALIDATING",
             "error_message": None,
             "completed_steps": [],
+            "user_requirement": task.user_requirement,
+            "acceptance_criteria": criteria,
+            "qa_cycle": 0,
+            "max_qa_cycles": 3,
+            "review_cycle": 0,
+            "max_review_cycles": 2,
+            "qa_result": None,
+            "review_result": None,
+            "failure_history": [],
+            "feedback_for_developer": None,
+            "qa_reports_data": [],
+            "review_reports_data": [],
         }
 
         execution.status = "CLONING"
@@ -393,7 +664,6 @@ class ExecutionService:
                 "error_message": f"Execution engine error: {err_text}",
             }
         finally:
-            # Always release execution lock
             release_execution_lock(db, task.id, lock_token)
 
         self._persist_results(db, task, execution, final_state)
@@ -410,10 +680,6 @@ class ExecutionService:
         if not lock_token:
             raise RuntimeError("Task execution is already running on another worker.")
 
-        # Determine already completed steps from FileChange / logs
-        completed_step_numbers = [
-            fc.execution_id for fc in execution.file_changes
-        ]
         completed_steps = [
             log.step_number for log in execution.logs if log.agent == "DeveloperAgent" and log.level == "INFO"
         ]
@@ -422,6 +688,10 @@ class ExecutionService:
         if task.implementation_plan:
             plan_data = task.implementation_plan.__dict__.copy()
             plan_data.pop("_sa_instance_state", None)
+
+        criteria: List[str] = []
+        if task.requirement_analysis and task.requirement_analysis.acceptance_criteria:
+            criteria = list(task.requirement_analysis.acceptance_criteria)
 
         resume_state: ExecutionState = {
             "task_id": task.id,
@@ -437,6 +707,18 @@ class ExecutionService:
             "status": "EXECUTING",
             "error_message": None,
             "completed_steps": completed_steps,
+            "user_requirement": task.user_requirement,
+            "acceptance_criteria": criteria,
+            "qa_cycle": len(execution.qa_reports),
+            "max_qa_cycles": 3,
+            "review_cycle": len(execution.review_reports),
+            "max_review_cycles": 2,
+            "qa_result": None,
+            "review_result": None,
+            "failure_history": [r.failure_signature for r in execution.qa_reports if r.failure_signature],
+            "feedback_for_developer": None,
+            "qa_reports_data": [],
+            "review_reports_data": [],
         }
 
         try:
@@ -465,7 +747,7 @@ class ExecutionService:
         execution: TaskExecution,
         state: ExecutionState,
     ) -> None:
-        """Write execution outcomes to DB models. Workspace is NEVER deleted here."""
+        """Write execution, QA, and Code Review outcomes to DB models."""
         status = state["status"]
         execution.status = status
         execution.branch_name = state.get("branch_name")
@@ -475,14 +757,15 @@ class ExecutionService:
         execution.error_message = state.get("error_message")
         execution.completed_at = datetime.now(timezone.utc)
 
-        task.status = status  # AWAITING_QA, FAILED, CANCELLED
+        task.status = status
 
         dev_result = state.get("developer_result") or {}
         step_results = dev_result.get("step_results", [])
-        execution.total_steps = dev_result.get("steps_total", 0)
-        execution.current_step = dev_result.get("steps_completed", 0)
+        if dev_result.get("steps_total"):
+            execution.total_steps = dev_result.get("steps_total", 0)
+        if dev_result.get("steps_completed"):
+            execution.current_step = dev_result.get("steps_completed", 0)
 
-        # Existing file change paths to avoid duplicating on resume
         existing_paths = {fc.file_path for fc in execution.file_changes}
 
         for sr in step_results:
@@ -509,6 +792,59 @@ class ExecutionService:
             )
             db.add(log)
 
+        # Persist QA reports
+        for qr in state.get("qa_reports_data") or []:
+            qa_model = QAReport(
+                task_id=task.id,
+                execution_id=execution.id,
+                cycle_number=qr.get("cycle_number", 1),
+                overall_passed=qr.get("overall_passed", False),
+                commands_executed=qr.get("commands_executed", []),
+                tests_passed=qr.get("tests_passed", 0),
+                tests_failed=qr.get("tests_failed", 0),
+                tests_skipped=qr.get("tests_skipped", 0),
+                exit_codes=qr.get("exit_codes", []),
+                logs=qr.get("logs", ""),
+                failure_summary=qr.get("failure_summary"),
+                failure_signature=qr.get("failure_signature"),
+                test_details=[t.model_dump() if hasattr(t, "model_dump") else t for t in qr.get("test_details", [])],
+                acceptance_criteria_results=[c.model_dump() if hasattr(c, "model_dump") else c for c in qr.get("acceptance_criteria_results", [])],
+                actionable_feedback=qr.get("actionable_feedback"),
+            )
+            db.add(qa_model)
+            qa_log_msg = f"QA Cycle {qr.get('cycle_number')}: {'PASSED' if qr.get('overall_passed') else 'FAILED'}. Passed: {qr.get('tests_passed')}, Failed: {qr.get('tests_failed')}."
+            db.add(ExecutionLog(
+                execution_id=execution.id,
+                step_number=len(step_results) + qr.get("cycle_number", 1),
+                level="INFO" if qr.get("overall_passed") else "WARNING",
+                agent="QAEngineerAgent",
+                message=qa_log_msg,
+            ))
+
+        # Persist Code Review reports
+        for rr in state.get("review_reports_data") or []:
+            rev_model = CodeReviewReport(
+                task_id=task.id,
+                execution_id=execution.id,
+                cycle_number=rr.get("cycle_number", 1),
+                outcome=rr.get("outcome", "APPROVED"),
+                summary=rr.get("summary", ""),
+                correctness_assessment=rr.get("correctness_assessment", ""),
+                security_assessment=rr.get("security_assessment", ""),
+                quality_score=rr.get("quality_score", 8),
+                issues=[i.model_dump() if hasattr(i, "model_dump") else i for i in rr.get("issues", [])],
+                approval_recommendation=rr.get("approval_recommendation", ""),
+            )
+            db.add(rev_model)
+            rev_log_msg = f"Code Review Cycle {rr.get('cycle_number')}: Outcome={rr.get('outcome')}, Score={rr.get('quality_score')}/10. {rr.get('summary')}"
+            db.add(ExecutionLog(
+                execution_id=execution.id,
+                step_number=len(step_results) + 10 + rr.get("cycle_number", 1),
+                level="INFO" if rr.get("outcome") == "APPROVED" else "WARNING",
+                agent="CodeReviewerAgent",
+                message=rev_log_msg,
+            ))
+
         final_msg = f"Execution {status}." + (
             f" Commit: {state['commit_sha']}" if state.get("commit_sha") else ""
         ) + (
@@ -516,15 +852,15 @@ class ExecutionService:
         )
         db.add(ExecutionLog(
             execution_id=execution.id,
-            step_number=len(step_results) + 1,
-            level="INFO" if status == "AWAITING_QA" else "ERROR",
+            step_number=len(step_results) + 50,
+            level="INFO" if status in ("AWAITING_QA", "AWAITING_REVIEW", "AWAITING_DELIVERY") else "ERROR",
             agent="ExecutionService",
             message=final_msg,
         ))
         db.commit()
 
     async def _sequential_fallback(self, state: ExecutionState) -> ExecutionState:
-        """Minimal sequential pipeline when LangGraph is not available."""
+        """Sequential fallback pipeline when LangGraph is not available."""
         state = node_validate(state)
         if state["status"] == "FAILED":
             return state
@@ -534,4 +870,13 @@ class ExecutionService:
         state = await node_execute(state)
         if state["status"] == "FAILED":
             return state
-        return await node_commit(state)
+        state = await node_commit(state)
+        if state["status"] == "FAILED":
+            return state
+        state = await node_qa(state)
+        if route_qa(state) != "REVIEWING":
+            return state
+        state = await node_review(state)
+        if route_review(state) == "AWAITING_DELIVERY":
+            return node_delivery(state)
+        return state

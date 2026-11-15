@@ -1,6 +1,6 @@
 """Pydantic schemas for specialized agents' structured outputs."""
 
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -176,3 +176,72 @@ class ArchitectPlanOutput(BaseModel):
         return []
 
 
+# ── Chapter 4: QA Engineer & Code Reviewer Schemas ──────────────────────────
+
+
+class QATestResult(BaseModel):
+    """Result of an individual test case."""
+    test_name: str = Field(description="Name or identifier of the test case.")
+    status: str = Field(default="PASSED", description="Outcome: PASSED, FAILED, or SKIPPED.")
+    duration_ms: Optional[float] = Field(default=0.0, description="Duration in milliseconds if available.")
+    error_message: Optional[str] = Field(default=None, description="Error message if test failed.")
+    stack_trace: Optional[str] = Field(default=None, description="Stack trace or failure log excerpt.")
+
+
+class AcceptanceCriterionResult(BaseModel):
+    """Validation status for an individual acceptance criterion."""
+    criterion: str = Field(description="The acceptance criterion text.")
+    status: str = Field(default="SATISFIED", description="Status: SATISFIED, NOT_SATISFIED, or UNKNOWN.")
+    evidence: str = Field(default="", description="Concrete evidence or test justification.")
+
+
+class QAOutput(BaseModel):
+    """Validated structured output produced by QA Engineer Agent."""
+
+    test_execution_id: str = Field(description="Unique identifier for this QA test run.")
+    overall_passed: bool = Field(description="True if all critical test suites and criteria pass.")
+    commands_executed: List[str] = Field(default_factory=list, description="List of shell test commands executed.")
+    tests_passed: int = Field(default=0, description="Total count of passing tests.")
+    tests_failed: int = Field(default=0, description="Total count of failing tests.")
+    tests_skipped: int = Field(default=0, description="Total count of skipped tests.")
+    exit_codes: List[int] = Field(default_factory=list, description="Process exit codes of executed commands.")
+    logs: str = Field(default="", description="Sanitized stdout and stderr logs from test execution.")
+    failure_summary: Optional[str] = Field(default=None, description="Executive summary of failures if any occurred.")
+    failure_signature: Optional[str] = Field(default=None, description="Deterministic hash/fingerprint of failing tests for stall detection.")
+    test_details: List[QATestResult] = Field(default_factory=list, description="Itemized individual test results.")
+    acceptance_criteria_results: List[AcceptanceCriterionResult] = Field(default_factory=list, description="Evaluation of acceptance criteria.")
+    actionable_feedback: Optional[str] = Field(default=None, description="Specific feedback provided to Developer Agent if retry required.")
+
+    @field_validator("commands_executed", mode="before")
+    @classmethod
+    def normalize_commands(cls, v: Any) -> List[str]:
+        return _flatten_string_list(v)
+
+
+class ReviewIssue(BaseModel):
+    """Specific finding or concern raised during Code Review."""
+    severity: str = Field(default="MEDIUM", description="Severity: CRITICAL, HIGH, MEDIUM, LOW, or INFO.")
+    file_path: str = Field(description="File path where issue was found.")
+    line_number: Optional[int] = Field(default=None, description="Approximate line number if applicable.")
+    description: str = Field(description="Clear explanation of the problem or vulnerability.")
+    suggested_fix: Optional[str] = Field(default=None, description="Concrete recommendation to resolve the issue.")
+
+
+class CodeReviewOutput(BaseModel):
+    """Validated structured output produced by Code Reviewer Agent."""
+
+    outcome: str = Field(description="Verdict: APPROVED, CHANGES_REQUESTED, or BLOCKED.")
+    summary: str = Field(description="Executive summary of the code review.")
+    correctness_assessment: str = Field(default="", description="Evaluation of logical correctness and business logic.")
+    security_assessment: str = Field(default="", description="Evaluation of security implications (injections, auth, data leak).")
+    quality_score: int = Field(default=7, ge=1, le=10, description="Overall code quality score between 1 and 10.")
+    issues: List[ReviewIssue] = Field(default_factory=list, description="Itemized list of detected issues.")
+    approval_recommendation: str = Field(default="", description="Final guidance for proceeding to delivery or required changes.")
+
+    @field_validator("outcome")
+    @classmethod
+    def validate_outcome(cls, v: str) -> str:
+        upper = v.strip().upper()
+        if upper not in ("APPROVED", "CHANGES_REQUESTED", "BLOCKED"):
+            raise ValueError(f"Invalid review outcome '{v}'. Must be APPROVED, CHANGES_REQUESTED, or BLOCKED.")
+        return upper

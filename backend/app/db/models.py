@@ -147,6 +147,8 @@ class Task(Base):
     approvals: Mapped[List["PlanApproval"]] = relationship("PlanApproval", back_populates="task", cascade="all, delete-orphan")
     executions: Mapped[List["TaskExecution"]] = relationship("TaskExecution", back_populates="task", cascade="all, delete-orphan")
     lock: Mapped[Optional["ExecutionLock"]] = relationship("ExecutionLock", back_populates="task", uselist=False, cascade="all, delete-orphan")
+    qa_reports: Mapped[List["QAReport"]] = relationship("QAReport", back_populates="task", cascade="all, delete-orphan", order_by="QAReport.created_at")
+    review_reports: Mapped[List["CodeReviewReport"]] = relationship("CodeReviewReport", back_populates="task", cascade="all, delete-orphan", order_by="CodeReviewReport.created_at")
 
 
 # ── Group C: Planning & Review ──────────────────────────────────────────────
@@ -261,6 +263,8 @@ class TaskExecution(Base):
     file_changes: Mapped[List["FileChange"]] = relationship("FileChange", back_populates="execution", cascade="all, delete-orphan")
     logs: Mapped[List["ExecutionLog"]] = relationship("ExecutionLog", back_populates="execution", cascade="all, delete-orphan", order_by="ExecutionLog.step_number")
     lock: Mapped[Optional["ExecutionLock"]] = relationship("ExecutionLock", back_populates="execution", uselist=False, cascade="all, delete-orphan")
+    qa_reports: Mapped[List["QAReport"]] = relationship("QAReport", back_populates="execution", cascade="all, delete-orphan", order_by="QAReport.cycle_number")
+    review_reports: Mapped[List["CodeReviewReport"]] = relationship("CodeReviewReport", back_populates="execution", cascade="all, delete-orphan", order_by="CodeReviewReport.cycle_number")
 
 
 class FileChange(Base):
@@ -313,3 +317,58 @@ class ExecutionLock(Base):
     # Relationships
     task: Mapped["Task"] = relationship("Task", back_populates="lock")
     execution: Mapped["TaskExecution"] = relationship("TaskExecution", back_populates="lock")
+
+
+# ── Group E: Quality Assurance & Code Review ───────────────────────────────
+
+
+class QAReport(Base):
+    """Structured QA test execution report produced by QA Engineer Agent."""
+
+    __tablename__ = "qa_reports"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    task_id: Mapped[str] = mapped_column(String(36), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    execution_id: Mapped[str] = mapped_column(String(36), ForeignKey("task_executions.id", ondelete="CASCADE"), nullable=False, index=True)
+    cycle_number: Mapped[int] = mapped_column(Integer, default=1)
+    overall_passed: Mapped[bool] = mapped_column(Boolean, default=False)
+    commands_executed: Mapped[List[str]] = mapped_column(JSON, default=list)
+    tests_passed: Mapped[int] = mapped_column(Integer, default=0)
+    tests_failed: Mapped[int] = mapped_column(Integer, default=0)
+    tests_skipped: Mapped[int] = mapped_column(Integer, default=0)
+    exit_codes: Mapped[List[int]] = mapped_column(JSON, default=list)
+    logs: Mapped[str] = mapped_column(Text, default="")
+    failure_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    failure_signature: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    test_details: Mapped[List[Dict[str, Any]]] = mapped_column(JSON, default=list)
+    acceptance_criteria_results: Mapped[List[Dict[str, Any]]] = mapped_column(JSON, default=list)
+    actionable_feedback: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    # Relationships
+    task: Mapped["Task"] = relationship("Task", back_populates="qa_reports")
+    execution: Mapped["TaskExecution"] = relationship("TaskExecution", back_populates="qa_reports")
+
+
+class CodeReviewReport(Base):
+    """Structured Code Review report produced by Code Reviewer Agent."""
+
+    __tablename__ = "code_review_reports"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    task_id: Mapped[str] = mapped_column(String(36), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    execution_id: Mapped[str] = mapped_column(String(36), ForeignKey("task_executions.id", ondelete="CASCADE"), nullable=False, index=True)
+    cycle_number: Mapped[int] = mapped_column(Integer, default=1)
+    outcome: Mapped[str] = mapped_column(String(50), nullable=False)  # APPROVED, CHANGES_REQUESTED, BLOCKED
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    correctness_assessment: Mapped[str] = mapped_column(Text, default="")
+    security_assessment: Mapped[str] = mapped_column(Text, default="")
+    quality_score: Mapped[int] = mapped_column(Integer, default=7)
+    issues: Mapped[List[Dict[str, Any]]] = mapped_column(JSON, default=list)
+    approval_recommendation: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    # Relationships
+    task: Mapped["Task"] = relationship("Task", back_populates="review_reports")
+    execution: Mapped["TaskExecution"] = relationship("TaskExecution", back_populates="review_reports")
+

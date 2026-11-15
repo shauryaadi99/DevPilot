@@ -44,12 +44,31 @@ def get_current_branch(workspace_path: Path) -> str:
     return repo.active_branch.name
 
 
-def get_diff(workspace_path: Path) -> str:
-    """Return unified diff of all staged + unstaged changes."""
-    repo = Repo(str(workspace_path))
-    staged = repo.git.diff("--cached")
-    unstaged = repo.git.diff()
-    return (staged + "\n" + unstaged).strip()
+def get_diff(workspace_path: Path, base_branch: str = "main") -> str:
+    """Return unified diff of active changes, or branch changes against base branch if clean."""
+    try:
+        repo = Repo(str(workspace_path), search_parent_directories=True)
+    except Exception:
+        return ""
+
+    try:
+        staged = repo.git.diff("--cached")
+        unstaged = repo.git.diff()
+        active_diff = (staged + "\n" + unstaged).strip()
+        if active_diff:
+            return active_diff
+        try:
+            branch_diff = repo.git.diff(f"{base_branch}...HEAD")
+            if branch_diff.strip():
+                return branch_diff.strip()
+        except Exception:
+            pass
+        try:
+            return repo.git.diff("HEAD~1").strip()
+        except Exception:
+            return ""
+    except Exception:
+        return ""
 
 
 # ── Idempotent workspace preparation ───────────────────────────────────────

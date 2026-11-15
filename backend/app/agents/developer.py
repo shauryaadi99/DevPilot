@@ -68,6 +68,7 @@ class DeveloperAgent:
         workspace_path: Path,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
         completed_step_numbers: Optional[set[int]] = None,
+        feedback: Optional[str] = None,
     ) -> DeveloperResult:
         """Execute the full approved plan inside workspace_path.
 
@@ -76,6 +77,7 @@ class DeveloperAgent:
             workspace_path: Absolute path to cloned task workspace.
             progress_callback: Called with (current_step, total_steps, message) on each step.
             completed_step_numbers: Set of step numbers already successfully executed (for resume).
+            feedback: Corrective feedback from QA or Code Review if in a retry cycle.
 
         Returns:
             DeveloperResult with per-step outcomes.
@@ -115,7 +117,7 @@ class DeveloperAgent:
             if progress_callback:
                 progress_callback(i, total, f"Executing: {step_title}")
 
-            result = await self._execute_step(step, plan, fs, i)
+            result = await self._execute_step(step, plan, fs, i, feedback=feedback)
             step_results.append(result)
 
             if not result.success:
@@ -141,6 +143,7 @@ class DeveloperAgent:
         plan: ArchitectPlanOutput,
         fs: FilesystemTools,
         step_num: int,
+        feedback: Optional[str] = None,
     ) -> StepResult:
         """Run a single implementation step via LLM + filesystem tools."""
         step_title = step.title if hasattr(step, "title") else f"Step {step_num}"
@@ -178,6 +181,8 @@ class DeveloperAgent:
             f"Target file: {target_file or 'determine from description'}\n"
             f"Change type: {change_type}"
         )
+        if feedback:
+            plan_summary += f"\nCORRECTIVE FEEDBACK FROM QA / REVIEW:\n{feedback}\nPlease address and correct these specific issues in this step."
 
         user_prompt = (
             f"{plan_summary}\n\n"

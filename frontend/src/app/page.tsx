@@ -19,6 +19,7 @@ import {
   getExecutionStatus,
   cancelExecution,
   closeTask,
+  runQa,
   getSessionState,
   submitPat,
   getPatStatus,
@@ -32,6 +33,8 @@ import {
   type GitHubRepo,
   type TaskDetail,
   type ExecutionStatus,
+  type QAReportData,
+  type CodeReviewReportData,
   type UserProfile,
   type PatStatus,
 } from "@/lib/api";
@@ -40,6 +43,7 @@ import {
   Cpu,
   RefreshCw,
   CheckCircle,
+  CheckCircle2,
   AlertTriangle,
   Server,
   Zap,
@@ -67,7 +71,7 @@ import {
 } from "@/components/ui/Icons";
 
 export default function WorkspacePage() {
-  const [activeTab, setActiveTab] = useState<"planning" | "diagnostics" | "execution">("planning");
+  const [activeTab, setActiveTab] = useState<"planning" | "diagnostics" | "execution" | "qa">("planning");
 
   // Chapter 1 Diagnostics State
   const [health, setHealth] = useState<HealthResponse | null>(null);
@@ -416,8 +420,22 @@ export default function WorkspacePage() {
     }
   };
 
+  const handleStartQa = async () => {
+    if (!currentTask) return;
+    try {
+      setExecutingPlan(true);
+      setExecutionError(null);
+      await runQa(currentTask.id);
+      setPollingExecution(true);
+      pollExecutionStatus(currentTask.id);
+    } catch (err: any) {
+      setExecutionError(err?.message || "Failed to start QA & Code Review.");
+      setExecutingPlan(false);
+    }
+  };
+
   const pollExecutionStatus = async (taskId: string) => {
-    const TERMINAL = ["AWAITING_QA", "AWAITING_REVIEW", "AWAITING_DELIVERY", "COMPLETED", "FAILED", "CANCELLED", "CLOSED"];
+    const TERMINAL = ["AWAITING_DELIVERY", "COMPLETED", "FAILED", "CANCELLED", "CLOSED"];
     let attempts = 0;
     const MAX_ATTEMPTS = 120; // 10 min at 5s intervals
     const poll = async () => {
@@ -490,8 +508,8 @@ export default function WorkspacePage() {
         <Sidebar activeTab={activeTab} onTabChange={setActiveTab} />
 
         <main className="flex-1 overflow-y-auto p-6 md:p-8 space-y-6">
-          {/* Chapter 2: Repo Intelligence & Planning View */}
-          {(activeTab === "planning" || activeTab === "execution") && (
+          {/* Chapter 2, 3 & 4: Repo Intelligence, Planning, Execution & QA View */}
+          {(activeTab === "planning" || activeTab === "execution" || activeTab === "qa") && (
             <div className="space-y-6">
               {/* Header Title */}
               <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-6 border-b border-gray-800">
@@ -942,7 +960,7 @@ export default function WorkspacePage() {
                           <Cpu className="w-5 h-5 text-blue-400" />
                           Architect Agent: Implementation Plan
                         </div>
-                        <StatusBadge status={currentTask.status} />
+                        <StatusBadge status={currentTask.plan_approval_status || (currentTask.is_plan_approved ? "APPROVED" : "FORMULATED")} />
                       </div>
 
                       <div className="space-y-2">
@@ -1227,16 +1245,27 @@ export default function WorkspacePage() {
                                   Resume Interrupted Plan
                                 </button>
                               )}
-                              <button
-                                onClick={handleExecutePlan}
-                                disabled={executingPlan || ["AWAITING_QA","AWAITING_REVIEW","AWAITING_DELIVERY","CLOSED"].includes(executionStatus?.status || "")}
-                                className="px-5 py-2.5 rounded-lg bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-xs font-semibold text-white transition-all shadow-lg shadow-purple-950/40 flex items-center gap-2 disabled:opacity-40"
-                              >
-                                <Sparkles className="w-4 h-4" />
-                                {executionStatus?.status === "FAILED" || executionStatus?.status === "CANCELLED" || currentTask.status === "FAILED"
-                                  ? "Retry Execution"
-                                  : "Execute Approved Plan"}
-                              </button>
+                              {executionStatus?.status === "AWAITING_QA" ? (
+                                <button
+                                  onClick={handleStartQa}
+                                  disabled={executingPlan}
+                                  className="px-5 py-2.5 rounded-lg bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-xs font-semibold text-white transition-all shadow-lg shadow-emerald-950/40 flex items-center gap-2 disabled:opacity-40"
+                                >
+                                  <ShieldCheck className="w-4 h-4" />
+                                  {executingPlan ? "Running QA & Review..." : "Start QA & Code Review"}
+                                </button>
+                              ) : (
+                                <button
+                                  onClick={handleExecutePlan}
+                                  disabled={executingPlan || ["AWAITING_REVIEW","AWAITING_DELIVERY","CLOSED"].includes(executionStatus?.status || "")}
+                                  className="px-5 py-2.5 rounded-lg bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-xs font-semibold text-white transition-all shadow-lg shadow-purple-950/40 flex items-center gap-2 disabled:opacity-40"
+                                >
+                                  <Sparkles className="w-4 h-4" />
+                                  {executionStatus?.status === "FAILED" || executionStatus?.status === "CANCELLED" || currentTask.status === "FAILED"
+                                    ? "Retry Execution"
+                                    : "Execute Approved Plan"}
+                                </button>
+                              )}
                               {["AWAITING_QA", "AWAITING_REVIEW", "AWAITING_DELIVERY", "FAILED", "CANCELLED"].includes(executionStatus?.status || currentTask.status) && (
                                 <button
                                   onClick={async () => {
@@ -1317,7 +1346,7 @@ export default function WorkspacePage() {
                           <div className="flex items-center justify-between pb-2 border-b border-gray-800/80">
                             <span className="text-xs font-semibold text-gray-400 uppercase tracking-wider flex items-center gap-1.5">
                               <Terminal className="w-3.5 h-3.5 text-gray-400" />
-                              Execution Audit Trail & Logs
+                              Execution Audit Trail &amp; Logs
                             </span>
                             <span className="text-[10px] font-mono text-gray-500">
                               {executionStatus.logs.length} entries
@@ -1347,6 +1376,231 @@ export default function WorkspacePage() {
                           </div>
                         </div>
                       )}
+
+                      {/* Chapter 4 — Quality Assurance & Code Review Section */}
+                      <div className="p-5 rounded-xl bg-gray-900/60 border border-gray-800 space-y-5">
+                        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-4 border-b border-gray-800">
+                          <div className="flex items-center gap-3">
+                            <div className="w-10 h-10 rounded-lg bg-emerald-950/40 border border-emerald-800/60 flex items-center justify-center text-emerald-400">
+                              <ShieldCheck className="w-5 h-5" />
+                            </div>
+                            <div>
+                              <div className="flex items-center gap-2">
+                                <h4 className="text-sm font-semibold text-white">Chapter 4 — Quality Assurance &amp; Code Review</h4>
+                                <StatusBadge
+                                  status={
+                                    executionStatus?.status === "AWAITING_DELIVERY" || currentTask?.status === "AWAITING_DELIVERY"
+                                      ? "AWAITING_DELIVERY"
+                                      : executionStatus?.status === "FAILED"
+                                      ? "FAILED"
+                                      : (executionStatus?.qa_reports && executionStatus.qa_reports.length > 0)
+                                      ? "ACTIVE"
+                                      : "AWAITING_QA"
+                                  }
+                                />
+                              </div>
+                              <p className="text-xs text-gray-400 mt-0.5">
+                                Automated test execution, bounded developer recovery loops, deterministic stall detection, and independent code review.
+                              </p>
+                            </div>
+                          </div>
+
+                          <div className="flex items-center gap-2">
+                            <span className="text-xs px-2.5 py-1 rounded-md bg-gray-800 border border-gray-700 text-gray-300 font-mono">
+                              QA Cycles: {executionStatus?.qa_reports?.length || 0}/3
+                            </span>
+                            <span className="text-xs px-2.5 py-1 rounded-md bg-gray-800 border border-gray-700 text-gray-300 font-mono">
+                              Review Cycles: {executionStatus?.review_reports?.length || 0}/2
+                            </span>
+                          </div>
+                        </div>
+
+                        {/* QA Test Reports List */}
+                        {executionStatus?.qa_reports && executionStatus.qa_reports.length > 0 ? (
+                          <div className="space-y-4">
+                            {executionStatus.qa_reports.map((qa, qIdx) => (
+                              <div key={qIdx} className="p-4 rounded-xl bg-gray-950/80 border border-gray-800 space-y-3">
+                                <div className="flex items-center justify-between border-b border-gray-800/80 pb-2">
+                                  <div className="flex items-center gap-2">
+                                    <span className="text-xs font-semibold text-gray-200">
+                                      QA Cycle #{qa.cycle_number}
+                                    </span>
+                                    <span
+                                      className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
+                                        qa.overall_passed
+                                          ? "bg-emerald-950 text-emerald-400 border border-emerald-800/60"
+                                          : "bg-rose-950 text-rose-400 border border-rose-800/60"
+                                      }`}
+                                    >
+                                      {qa.overall_passed ? "PASSED" : "FAILURES DETECTED"}
+                                    </span>
+                                  </div>
+                                  {qa.failure_signature && (
+                                    <span className="text-[10px] font-mono text-gray-500">
+                                      Sig: {qa.failure_signature}
+                                    </span>
+                                  )}
+                                </div>
+
+                                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs font-mono">
+                                  <div className="p-2.5 rounded-lg bg-gray-900 border border-gray-800 flex items-center justify-between">
+                                    <span className="text-gray-400">Passed:</span>
+                                    <span className="text-emerald-400 font-bold">{qa.tests_passed}</span>
+                                  </div>
+                                  <div className="p-2.5 rounded-lg bg-gray-900 border border-gray-800 flex items-center justify-between">
+                                    <span className="text-gray-400">Failed:</span>
+                                    <span className={qa.tests_failed > 0 ? "text-rose-400 font-bold" : "text-gray-500"}>
+                                      {qa.tests_failed}
+                                    </span>
+                                  </div>
+                                  <div className="p-2.5 rounded-lg bg-gray-900 border border-gray-800 flex items-center justify-between">
+                                    <span className="text-gray-400">Skipped:</span>
+                                    <span className="text-gray-400">{qa.tests_skipped}</span>
+                                  </div>
+                                  <div className="p-2.5 rounded-lg bg-gray-900 border border-gray-800 flex items-center justify-between">
+                                    <span className="text-gray-400">Commands:</span>
+                                    <span className="text-blue-400 truncate max-w-[120px]" title={qa.commands_executed?.join(", ")}>
+                                      {qa.commands_executed?.join(", ")}
+                                    </span>
+                                  </div>
+                                </div>
+
+                                {qa.acceptance_criteria_results && qa.acceptance_criteria_results.length > 0 && (
+                                  <div className="space-y-1.5 pt-1">
+                                    <span className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider">
+                                      Acceptance Criteria Validation
+                                    </span>
+                                    <div className="space-y-1">
+                                      {qa.acceptance_criteria_results.map((cr: any, cIdx: number) => (
+                                        <div key={cIdx} className="flex items-start gap-2 text-xs p-2 rounded bg-gray-900/60 border border-gray-800/60">
+                                          <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${cr.status === "SATISFIED" ? "bg-emerald-950 text-emerald-400" : "bg-rose-950 text-rose-400"}`}>
+                                            {cr.status}
+                                          </span>
+                                          <span className="text-gray-300">{cr.criterion}</span>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </div>
+                                )}
+
+                                {qa.actionable_feedback && (
+                                  <div className="p-3 rounded bg-amber-950/30 border border-amber-800/40 text-xs text-amber-200">
+                                    <span className="font-semibold text-amber-300">Developer Diagnostic Feedback:</span>
+                                    <p className="mt-0.5 text-[11px] text-amber-200/90">{qa.actionable_feedback}</p>
+                                  </div>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="p-5 rounded-xl bg-gray-950/40 border border-gray-800 text-xs text-center space-y-3">
+                            <p className="text-gray-400">
+                              Developer Agent has committed changes to <code className="text-purple-300 font-mono bg-purple-950/40 px-1.5 py-0.5 rounded border border-purple-800/40">{executionStatus?.branch_name || `devpilot/task-${currentTask.id.slice(0, 8)}`}</code>.
+                            </p>
+                            <div>
+                              <button
+                                onClick={handleStartQa}
+                                disabled={executingPlan}
+                                className="px-5 py-2.5 rounded-lg bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-semibold text-xs transition-all shadow-lg shadow-emerald-950/40 inline-flex items-center gap-2 disabled:opacity-50"
+                              >
+                                <ShieldCheck className="w-4 h-4" />
+                                {executingPlan ? "Running QA & Review..." : "Start QA & Code Review"}
+                              </button>
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Code Reviewer Reports */}
+                        {executionStatus?.review_reports && executionStatus.review_reports.length > 0 && (
+                          <div className="space-y-4 pt-3 border-t border-gray-800">
+                            <h5 className="text-xs font-semibold uppercase tracking-wider text-gray-300 flex items-center gap-2">
+                              <ShieldCheck className="w-4 h-4 text-purple-400" />
+                              Independent Code Review Reports
+                            </h5>
+                            {executionStatus.review_reports.map((rev, rIdx) => (
+                              <div key={rIdx} className="p-4 rounded-xl bg-gray-950/80 border border-gray-800 space-y-3">
+                                <div className="flex items-center justify-between border-b border-gray-800/80 pb-2">
+                                  <div className="flex items-center gap-2.5">
+                                    <span className="text-xs font-semibold text-gray-200">Review Cycle #{rev.cycle_number}</span>
+                                    <span
+                                      className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
+                                        rev.outcome === "APPROVED"
+                                          ? "bg-emerald-950 text-emerald-400 border border-emerald-800/60"
+                                          : rev.outcome === "CHANGES_REQUESTED"
+                                          ? "bg-amber-950 text-amber-400 border border-amber-800/60"
+                                          : "bg-rose-950 text-rose-400 border border-rose-800/60"
+                                      }`}
+                                    >
+                                      {rev.outcome}
+                                    </span>
+                                  </div>
+                                  <div className="flex items-center gap-1.5 text-xs">
+                                    <span className="text-gray-400">Quality Score:</span>
+                                    <span className="font-bold text-emerald-400 font-mono">{rev.quality_score}/10</span>
+                                  </div>
+                                </div>
+
+                                <p className="text-xs text-gray-300">{rev.summary}</p>
+
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs">
+                                  <div className="p-2.5 rounded bg-gray-900 border border-gray-800">
+                                    <span className="font-semibold text-blue-400">Correctness: </span>
+                                    <span className="text-gray-300">{rev.correctness_assessment}</span>
+                                  </div>
+                                  <div className="p-2.5 rounded bg-gray-900 border border-gray-800">
+                                    <span className="font-semibold text-emerald-400">Security: </span>
+                                    <span className="text-gray-300">{rev.security_assessment}</span>
+                                  </div>
+                                </div>
+
+                                {rev.issues && rev.issues.length > 0 && (
+                                  <div className="space-y-1.5 pt-1">
+                                    <span className="text-[11px] font-semibold text-gray-400 uppercase tracking-wider">
+                                      Identified Issues ({rev.issues.length})
+                                    </span>
+                                    <div className="space-y-1">
+                                      {rev.issues.map((iss, iIdx) => (
+                                        <div key={iIdx} className="p-2 rounded bg-gray-900/60 border border-gray-800 text-xs space-y-1">
+                                          <div className="flex items-center justify-between">
+                                            <div className="flex items-center gap-2">
+                                              <span className={`text-[10px] font-bold px-1.5 py-0.2 rounded ${iss.severity === "CRITICAL" ? "bg-rose-950 text-rose-400" : iss.severity === "HIGH" ? "bg-amber-950 text-amber-400" : "bg-blue-950 text-blue-400"}`}>
+                                                {iss.severity}
+                                              </span>
+                                              <span className="font-mono text-gray-200">{iss.file_path}{iss.line_number ? `:${iss.line_number}` : ""}</span>
+                                            </div>
+                                          </div>
+                                          <p className="text-gray-300 text-[11px]">{iss.description}</p>
+                                          {iss.suggested_fix && (
+                                            <p className="text-emerald-400/90 text-[11px]">Fix: {iss.suggested_fix}</p>
+                                          )}
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+
+                        {/* Ready for Chapter 5 Delivery Banner */}
+                        {(executionStatus?.review_reports?.some((r) => r.outcome === "APPROVED") || currentTask?.status === "AWAITING_DELIVERY") && (
+                          <div className="p-4 rounded-xl bg-gradient-to-r from-emerald-950/60 to-blue-950/60 border border-emerald-800/80 flex items-center justify-between">
+                            <div className="flex items-center gap-3">
+                              <CheckCircle2 className="w-6 h-6 text-emerald-400 shrink-0" />
+                              <div>
+                                <div className="font-semibold text-white text-sm">Chapter 4 QA &amp; Code Review Verified</div>
+                                <p className="text-xs text-emerald-200/80">
+                                  All automated tests pass and Code Reviewer has APPROVED the implementation. Task branch is ready for Chapter 5 GitHub Pull Request Delivery.
+                                </p>
+                              </div>
+                            </div>
+                            <span className="px-3 py-1.5 rounded-lg bg-emerald-800/60 text-xs font-semibold text-emerald-200 border border-emerald-700/60 flex items-center gap-1.5 shrink-0">
+                              <Check className="w-3.5 h-3.5" /> Ready for Delivery
+                            </span>
+                          </div>
+                        )}
+                      </div>
                     </div>
                   )}
                 </div>

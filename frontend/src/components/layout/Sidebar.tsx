@@ -11,8 +11,8 @@ import {
 } from "@/components/ui/Icons";
 
 interface SidebarProps {
-  activeTab?: "diagnostics" | "planning" | "execution";
-  onTabChange?: (tab: "diagnostics" | "planning" | "execution") => void;
+  activeTab?: "diagnostics" | "planning" | "execution" | "qa";
+  onTabChange?: (tab: "diagnostics" | "planning" | "execution" | "qa") => void;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -41,7 +41,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
     {
       num: 3,
       title: "Autonomous Engine",
-      completed: false,
+      completed: true,
       active: activeTab === "planning" || activeTab === "execution",
       desc: "Developer Agent, Isolated Sandbox, Git",
       icon: Cpu,
@@ -51,9 +51,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
       num: 4,
       title: "QA & Code Review",
       completed: false,
-      active: false,
+      active: activeTab === "qa",
       desc: "QA Engineer, Tests, Reviewer Agent",
       icon: CheckCircle2,
+      tab: "qa" as const,
     },
     {
       num: 5,

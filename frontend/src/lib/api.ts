@@ -442,6 +442,47 @@ export interface ExecutionLogEntry {
   timestamp: string;
 }
 
+export interface QAReportData {
+  id: string;
+  execution_id: string;
+  cycle_number: number;
+  overall_passed: boolean;
+  commands_executed: string[];
+  tests_passed: number;
+  tests_failed: number;
+  tests_skipped: number;
+  exit_codes: number[];
+  logs: string;
+  failure_summary?: string | null;
+  failure_signature?: string | null;
+  test_details?: any[];
+  acceptance_criteria_results?: any[];
+  actionable_feedback?: string | null;
+  created_at: string;
+}
+
+export interface ReviewIssueData {
+  severity: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW' | 'INFO' | string;
+  file_path: string;
+  line_number?: number | null;
+  description: string;
+  suggested_fix?: string | null;
+}
+
+export interface CodeReviewReportData {
+  id: string;
+  execution_id: string;
+  cycle_number: number;
+  outcome: 'APPROVED' | 'CHANGES_REQUESTED' | 'BLOCKED' | string;
+  summary: string;
+  correctness_assessment?: string;
+  security_assessment?: string;
+  quality_score: number;
+  issues: ReviewIssueData[];
+  approval_recommendation?: string;
+  created_at: string;
+}
+
 export interface ExecutionStatus {
   execution_id: string;
   task_id: string;
@@ -455,6 +496,8 @@ export interface ExecutionStatus {
   completed_at: string | null;
   file_changes: FileChangeData[];
   logs: ExecutionLogEntry[];
+  qa_reports?: QAReportData[];
+  review_reports?: CodeReviewReportData[];
 }
 
 export async function executeTask(
@@ -487,6 +530,22 @@ export async function resumeExecution(
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error(err.detail || `Resume failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function runQa(
+  taskId: string,
+): Promise<{ status: string; execution_id: string; task_id: string; message: string }> {
+  const url = `${API_BASE_URL}/api/v1/tasks/${taskId}/run-qa`;
+  const res = await fetch(url, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Accept": "application/json" },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `QA start failed: ${res.status}`);
   }
   return res.json();
 }
@@ -533,6 +592,39 @@ export async function closeTask(
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error(err.detail || `Close task failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+
+export async function getQaReports(
+  taskId: string
+): Promise<{ task_id: string; total_cycles: number; reports: QAReportData[] }> {
+  const url = `${API_BASE_URL}/api/v1/tasks/${taskId}/qa-reports`;
+  const res = await fetch(url, {
+    cache: "no-store",
+    credentials: "include",
+    headers: { Accept: "application/json" },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Failed to fetch QA reports: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function getReviewReports(
+  taskId: string
+): Promise<{ task_id: string; total_reviews: number; reports: CodeReviewReportData[] }> {
+  const url = `${API_BASE_URL}/api/v1/tasks/${taskId}/review-reports`;
+  const res = await fetch(url, {
+    cache: "no-store",
+    credentials: "include",
+    headers: { Accept: "application/json" },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Failed to fetch Code Review reports: ${res.status}`);
   }
   return res.json();
 }
