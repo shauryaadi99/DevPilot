@@ -1,10 +1,11 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useMemo } from "react";
 import { Header } from "@/components/layout/Header";
 import { Sidebar } from "@/components/layout/Sidebar";
 import { StatusBadge } from "@/components/ui/StatusBadge";
 import { PatModal } from "@/components/auth/PatModal";
+import { ChapterProgressBar, ChapterStatusInfo } from "@/components/ui/ChapterProgressBar";
 import {
   fetchHealth,
   testGroqConnection,
@@ -477,6 +478,186 @@ export default function WorkspacePage() {
 
   const backendOnline = !healthError && health !== null;
 
+  const chapterProgress = useMemo<ChapterStatusInfo[]>(() => {
+    // Chapter 1: Foundation & Setup
+    const ch1Complete = Boolean(health?.status === "healthy" && (user || patStatus?.has_pat));
+    const ch1Percent = ch1Complete ? 100 : health?.status === "healthy" ? 75 : 50;
+    const ch1Status = ch1Complete ? "COMPLETED" : "IN_PROGRESS";
+    const ch1Detail = ch1Complete ? "FastAPI, PostgreSQL & GitHub Connected" : "Connecting services...";
+
+    // Chapter 2: Repo Intelligence & Architecture
+    let ch2Percent = 0;
+    let ch2Status: "COMPLETED" | "IN_PROGRESS" | "PENDING" | "FAILED" = "PENDING";
+    let ch2Detail = "Select repository & formulate requirement";
+
+    if (selectedRepo) {
+      ch2Percent = 25;
+      ch2Status = "IN_PROGRESS";
+      ch2Detail = `Selected ${selectedRepo.name}`;
+    }
+
+    if (currentTask) {
+      if (["INSPECTING", "ANALYZING", "PLANNING"].includes(currentTask.status)) {
+        ch2Percent = 50;
+        ch2Status = "IN_PROGRESS";
+        ch2Detail = `Architect Agent ${currentTask.status.toLowerCase()}...`;
+      } else if (currentTask.status === "AWAITING_APPROVAL") {
+        ch2Percent = 75;
+        ch2Status = "IN_PROGRESS";
+        ch2Detail = "Implementation plan ready • Awaiting review";
+      } else if (currentTask.status === "REJECTED") {
+        ch2Percent = 60;
+        ch2Status = "FAILED";
+        ch2Detail = "Plan rejected by user";
+      } else if (
+        ["APPROVED", "EXECUTING", "AWAITING_QA", "AWAITING_REVIEW", "AWAITING_DELIVERY", "CLOSED"].includes(
+          currentTask.status
+        )
+      ) {
+        ch2Percent = 100;
+        ch2Status = "COMPLETED";
+        ch2Detail = "Plan Approved by Human Reviewer";
+      }
+    }
+
+    // Chapter 3: Autonomous Development Engine
+    let ch3Percent = 0;
+    let ch3Status: "COMPLETED" | "IN_PROGRESS" | "PENDING" | "FAILED" = "PENDING";
+    let ch3Detail = "Awaiting developer execution";
+
+    const isExecutingOrPastCh3 =
+      executionStatus &&
+      ["CLONING", "EXECUTING", "COMMITTING", "AWAITING_QA", "AWAITING_REVIEW", "AWAITING_DELIVERY", "CLOSED"].includes(
+        executionStatus.status
+      );
+
+    if (currentTask?.status === "APPROVED" && !isExecutingOrPastCh3) {
+      ch3Percent = 0;
+      ch3Status = "PENDING";
+      ch3Detail = "Approved • Ready to execute";
+    } else if (executionStatus?.status === "CLONING") {
+      ch3Percent = 20;
+      ch3Status = "IN_PROGRESS";
+      ch3Detail = "Cloning & isolating workspace...";
+    } else if (executionStatus?.status === "EXECUTING") {
+      const total = Math.max(executionStatus.total_steps || 1, 1);
+      const curr = executionStatus.current_step || 0;
+      ch3Percent = Math.min(85, Math.round(20 + (curr / total) * 65));
+      ch3Status = "IN_PROGRESS";
+      ch3Detail = `Developer Step ${curr} of ${total}`;
+    } else if (executionStatus?.status === "COMMITTING") {
+      ch3Percent = 90;
+      ch3Status = "IN_PROGRESS";
+      ch3Detail = "Staging & committing to task branch...";
+    } else if (
+      ["AWAITING_QA", "AWAITING_REVIEW", "AWAITING_DELIVERY", "CLOSED"].includes(executionStatus?.status || "") ||
+      ["AWAITING_QA", "AWAITING_REVIEW", "AWAITING_DELIVERY", "CLOSED"].includes(currentTask?.status || "")
+    ) {
+      ch3Percent = 100;
+      ch3Status = "COMPLETED";
+      ch3Detail = "Changes committed to task branch";
+    } else if (executionStatus?.status === "FAILED" || currentTask?.status === "FAILED") {
+      ch3Percent = 50;
+      ch3Status = "FAILED";
+      ch3Detail = executionStatus?.error_message?.slice(0, 45) || "Execution encountered an error";
+    }
+
+    // Chapter 4: QA & Code Review
+    let ch4Percent = 0;
+    let ch4Status: "COMPLETED" | "IN_PROGRESS" | "PENDING" | "FAILED" = "PENDING";
+    let ch4Detail = "Awaiting QA & review";
+
+    const hasQa = Boolean(executionStatus?.qa_reports && executionStatus.qa_reports.length > 0);
+    const hasReview = Boolean(executionStatus?.review_reports && executionStatus.review_reports.length > 0);
+    const reviewApproved = Boolean(executionStatus?.review_reports?.some((r) => r.outcome === "APPROVED"));
+    const isAwaitingDelivery = currentTask?.status === "AWAITING_DELIVERY" || executionStatus?.status === "AWAITING_DELIVERY";
+
+    if (isAwaitingDelivery || reviewApproved) {
+      ch4Percent = 100;
+      ch4Status = "COMPLETED";
+      ch4Detail = "Tests Passed & Code Review APPROVED";
+    } else if (executionStatus?.status === "AWAITING_REVIEW" || (hasQa && !hasReview)) {
+      ch4Percent = 60;
+      ch4Status = "IN_PROGRESS";
+      ch4Detail = `QA Cycle #${executionStatus?.qa_reports?.length || 1} • Reviewing diff...`;
+    } else if (executionStatus?.status === "AWAITING_QA") {
+      ch4Percent = 25;
+      ch4Status = "IN_PROGRESS";
+      ch4Detail = "Running repository-aware test suite...";
+    } else if (executionStatus?.status === "FAILED" && isExecutingOrPastCh3 && hasQa) {
+      ch4Percent = 40;
+      ch4Status = "FAILED";
+      ch4Detail = "QA or review issue detected";
+    }
+
+    // Chapter 5: GitHub Delivery
+    let ch5Percent = 0;
+    let ch5Status: "COMPLETED" | "IN_PROGRESS" | "PENDING" | "FAILED" = "PENDING";
+    let ch5Detail = isAwaitingDelivery ? "Ready for GitHub PR Delivery" : "Awaiting Chapter 4 completion";
+
+    if (currentTask?.status === "CLOSED") {
+      ch5Percent = 100;
+      ch5Status = "COMPLETED";
+      ch5Detail = "Delivery completed";
+    } else if (isAwaitingDelivery) {
+      ch5Percent = 0;
+      ch5Status = "PENDING";
+      ch5Detail = "Verified • Ready for Chapter 5 PR";
+    }
+
+    return [
+      {
+        num: 1,
+        title: "Foundation & Setup",
+        shortTitle: "Ch. 1 Foundation",
+        desc: "FastAPI, PostgreSQL & LLM Base",
+        status: ch1Status,
+        percent: ch1Percent,
+        detail: ch1Detail,
+        tab: "diagnostics",
+      },
+      {
+        num: 2,
+        title: "Repo Intelligence",
+        shortTitle: "Ch. 2 Intelligence",
+        desc: "Codebase Analysis & Architect Plan",
+        status: ch2Status,
+        percent: ch2Percent,
+        detail: ch2Detail,
+        tab: "planning",
+      },
+      {
+        num: 3,
+        title: "Autonomous Engine",
+        shortTitle: "Ch. 3 Autonomous Dev",
+        desc: "Developer Agent & Git Commit",
+        status: ch3Status,
+        percent: ch3Percent,
+        detail: ch3Detail,
+        tab: "execution",
+      },
+      {
+        num: 4,
+        title: "QA & Code Review",
+        shortTitle: "Ch. 4 QA & Review",
+        desc: "Test Discovery, Feedback & Reviewer",
+        status: ch4Status,
+        percent: ch4Percent,
+        detail: ch4Detail,
+        tab: "qa",
+      },
+      {
+        num: 5,
+        title: "GitHub Delivery",
+        shortTitle: "Ch. 5 Delivery",
+        desc: "PR Creation & Final Audit",
+        status: ch5Status,
+        percent: ch5Percent,
+        detail: ch5Detail,
+      },
+    ];
+  }, [health, user, patStatus, selectedRepo, currentTask, executionStatus]);
+
   const filteredRepos = repositories.filter(
     (r) =>
       r.name.toLowerCase().includes(repoSearch.toLowerCase()) ||
@@ -505,9 +686,16 @@ export default function WorkspacePage() {
       />
 
       <div className="flex flex-1 overflow-hidden">
-        <Sidebar activeTab={activeTab} onTabChange={setActiveTab} />
+        <Sidebar activeTab={activeTab} onTabChange={setActiveTab} chapters={chapterProgress} />
 
         <main className="flex-1 overflow-y-auto p-6 md:p-8 space-y-6">
+          {/* Chapter Progress & Status Bars across all 5 chapters */}
+          <ChapterProgressBar
+            chapters={chapterProgress}
+            activeTab={activeTab}
+            onTabChange={setActiveTab}
+          />
+
           {/* Chapter 2, 3 & 4: Repo Intelligence, Planning, Execution & QA View */}
           {(activeTab === "planning" || activeTab === "execution" || activeTab === "qa") && (
             <div className="space-y-6">
