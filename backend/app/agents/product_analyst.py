@@ -110,7 +110,7 @@ Generate the structured requirement analysis now in JSON format."""
                     messages=messages,
                     response_format={"type": "json_object"},
                     temperature=0.2,
-                    max_tokens=1500,
+                    max_tokens=3000,
                 )
                 raw_json = response.choices[0].message.content or "{}"
                 clean_json = raw_json.strip()

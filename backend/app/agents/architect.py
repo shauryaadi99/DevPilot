@@ -146,7 +146,7 @@ Produce the structured architecture and implementation plan now in JSON format."
                     messages=messages,
                     response_format={"type": "json_object"},
                     temperature=0.2,
-                    max_tokens=1800,
+                    max_tokens=4096,
                 )
                 raw_json = response.choices[0].message.content or "{}"
                 clean_json = raw_json.strip()

@@ -202,7 +202,7 @@ class DeveloperAgent:
                         {"role": "system", "content": DEVELOPER_SYSTEM_PROMPT},
                         {"role": "user", "content": user_prompt},
                     ],
-                    max_tokens=2500,
+                    max_tokens=8192,
                     response_format={"type": "json_object"},
                 )
                 raw_output = response.choices[0].message.content
