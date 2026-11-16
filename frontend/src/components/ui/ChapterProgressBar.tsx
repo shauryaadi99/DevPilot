@@ -179,3 +179,4 @@ export const ChapterProgressBar: React.FC<ChapterProgressBarProps> = ({
     </div>
   );
 };
+

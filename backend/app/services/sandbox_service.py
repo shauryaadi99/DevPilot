@@ -95,6 +95,8 @@ class SandboxService:
                 ["docker", "info"],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=5,
             )
             self._docker_available = (res.returncode == 0)
@@ -120,11 +122,17 @@ class SandboxService:
     def _sanitize_env(self, custom_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         """Create a clean environment stripped of all application and host secrets."""
         # Start with standard OS minimal variables
-        safe_keys = {"PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "USERPROFILE", "HOME", "LANG", "LC_ALL"}
+        safe_keys = {
+            "PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "USERPROFILE",
+            "HOME", "LANG", "LC_ALL", "PYTHONIOENCODING", "PYTHONUTF8",
+        }
         clean_env: Dict[str, str] = {}
         for k, v in os.environ.items():
             if k.upper() in safe_keys and k.upper() not in FORBIDDEN_ENV_KEYS:
                 clean_env[k] = v
+
+        clean_env.setdefault("PYTHONIOENCODING", "utf-8")
+        clean_env.setdefault("PYTHONUTF8", "1")
 
         # Add explicitly approved non-secret variables
         if custom_env:
@@ -209,6 +217,8 @@ class SandboxService:
                 docker_cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout,
             )
             duration = time.time() - start_time
@@ -260,6 +270,8 @@ class SandboxService:
                 shell=shell_mode,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout,
             )
             duration = time.time() - start_time
