@@ -51,13 +51,19 @@ class ApprovalRequest(BaseModel):
 
 
 def _task_to_summary_dict(task: Task) -> dict:
+    pr = getattr(task, "pull_request", None)
     return {
         "id": task.id,
         "repository_id": task.repository_id,
+        "repository_name": task.repository.full_name if task.repository else None,
         "user_id": task.user_id,
         "title": task.title,
         "requirement": task.user_requirement,
         "status": task.status,
+        "is_delivered": pr is not None,
+        "pr_number": pr.pr_number if pr else None,
+        "pr_url": pr.html_url if pr else None,
+        "pr_status": pr.status if pr else None,
         "created_at": task.created_at.isoformat() if task.created_at else None,
         "updated_at": task.updated_at.isoformat() if task.updated_at else None,
     }
@@ -99,9 +105,16 @@ def create_task(
 
 
 @router.get("", summary="List All Tasks")
-def list_tasks(limit: int = 20, db: Session = Depends(get_db)):
-    """List recent engineering tasks."""
-    tasks = db.query(Task).order_by(Task.created_at.desc()).limit(limit).all()
+def list_tasks(
+    repository_id: Optional[str] = None,
+    limit: int = 50,
+    db: Session = Depends(get_db),
+):
+    """List recent engineering tasks, optionally filtered by repository."""
+    query = db.query(Task)
+    if repository_id:
+        query = query.filter(Task.repository_id == repository_id)
+    tasks = query.order_by(Task.created_at.desc()).limit(limit).all()
     return [_task_to_summary_dict(t) for t in tasks]
 
 
@@ -215,6 +228,7 @@ def get_task(task_id: str, db: Session = Depends(get_db)):
 async def run_task_pipeline(
     task_id: str,
     x_github_token: Optional[str] = Header(None, alias="X-GitHub-Token"),
+    auth_context: Optional[tuple] = Depends(get_optional_current_user),
     db: Session = Depends(get_db),
 ):
     """Run the complete Chapter 2 pipeline:
@@ -228,8 +242,13 @@ async def run_task_pipeline(
     if not task:
         raise HTTPException(status_code=404, detail="Task not found.")
 
+    token = x_github_token
+    if not token and auth_context:
+        _, _, decrypted_pat = auth_context
+        token = decrypted_pat
+
     repo = task.repository
-    github_client = GitHubClient(token=x_github_token)
+    github_client = GitHubClient(token=token)
 
     try:
         # Step 1: Repository Inspection
@@ -554,9 +573,9 @@ async def execute_plan(
         )
 
     # 4. Task lifecycle state check:
-    # A task can enter execution only if it is in APPROVED state (initial execution)
-    # or in FAILED state (retry execution of an approved plan).
-    if task.status not in ("APPROVED", "FAILED"):
+    # A task can enter execution if it is in APPROVED state (initial execution)
+    # or in FAILED / CLOSED state (retry execution of an approved plan).
+    if task.status not in ("APPROVED", "FAILED", "CLOSED"):
         if task.status in ("PENDING", "INSPECTING", "ANALYZING", "PLANNING", "AWAITING_APPROVAL"):
             raise HTTPException(
                 status_code=403,
@@ -572,7 +591,7 @@ async def execute_plan(
                 status_code=409,
                 detail="Task is already executing.",
             )
-        elif task.status in ("AWAITING_QA", "AWAITING_REVIEW", "AWAITING_DELIVERY", "CLOSED"):
+        elif task.status in ("AWAITING_QA", "AWAITING_REVIEW", "AWAITING_DELIVERY"):
             raise HTTPException(
                 status_code=409,
                 detail=f"Task has already completed Chapter 3 execution (status: {task.status}). Cannot re-execute.",
@@ -592,7 +611,7 @@ async def execute_plan(
     if running:
         raise HTTPException(status_code=409, detail=f"Execution {running.id} is already running.")
 
-    is_retry = (task.status == "FAILED")
+    is_retry = (task.status in ("FAILED", "CLOSED"))
 
     # 6. Immediately update task lifecycle status
     task.status = "EXECUTING"
@@ -706,12 +725,12 @@ async def run_qa(
         token = decrypted_pat
 
     execution.status = "QA_TESTING"
-    task.status = "EXECUTING"
+    task.status = "QA_TESTING"
     db.commit()
 
     service = ExecutionService()
     background_tasks.add_task(
-        service.resume_plan,
+        service.run_qa_pipeline,
         db=db,
         task=task,
         execution=execution,
@@ -894,6 +913,25 @@ def close_task(task_id: str, db: Session = Depends(get_db)):
         "workspace_removed": removed,
         "message": "Task closed. Workspace has been released." if removed
                    else "Task closed. Workspace removal failed — check logs.",
+    }
+
+
+@router.post("/{task_id}/reopen", summary="Reopen a Closed or Completed Task (Chapter 3+)")
+def reopen_task(task_id: str, db: Session = Depends(get_db)):
+    """Reopen a task back to APPROVED state so it can be re-executed or revised."""
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+
+    task.status = "APPROVED"
+    db.commit()
+    db.refresh(task)
+
+    return {
+        "status": "reopened",
+        "task_id": task.id,
+        "task_status": task.status,
+        "message": "Task reopened. You may now re-execute the plan or revise it in Chapter 2.",
     }
 
 

@@ -50,5 +50,11 @@ def check_database_connection() -> Dict[str, Any]:
 
 
 def init_db() -> None:
-    """Ensure all application tables exist in PostgreSQL."""
+    """Ensure all application tables exist in PostgreSQL and columns are up to date."""
+    import app.db.models  # ensure all models are registered on metadata
     Base.metadata.create_all(bind=engine)
+    try:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE users ALTER COLUMN github_id DROP NOT NULL;"))
+    except Exception as e:
+        logger.debug(f"Column migration check: {e}")

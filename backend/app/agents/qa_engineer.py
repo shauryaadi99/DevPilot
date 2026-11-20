@@ -8,6 +8,7 @@ structured QA reports with actionable feedback for the Developer Agent.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -34,14 +35,15 @@ Your responsibility:
 CRITICAL RULES:
 - Never suggest adding test files or dependencies in languages not used by the repository (e.g. NEVER suggest Python tests or pytest for JavaScript/TypeScript repositories).
 - Never suggest installing dependencies unless they are genuinely missing from package.json or requirements.txt.
-- Focus exclusively on correcting the implementation logic in the files modified for the current task.
-- If the failure is an environment/configuration issue (e.g. missing dependencies or binary not found), clearly state that rather than suggesting code changes.
+- Focus on correcting the implementation logic, exports, and imports in the repository files.
+- Local relative imports (e.g., Cannot find module './...' or '../...'), missing exports, undefined route callbacks, and runtime/syntax errors are APPLICATION CODE BUGS. You MUST explicitly name the target file, the broken import/export, and instruct the Developer Agent to fix it.
+- If and only if the test runner binary itself cannot be found in the system (e.g. jest or pytest command not found), classify as an environment issue.
 
 Output Rules:
 - Return ONLY valid JSON matching this schema:
 {
   "failure_summary": "1 to 2 sentences diagnosing why tests failed, or null if all passed",
-  "actionable_feedback": "Concrete instructions for Developer Agent detailing the exact files, functions, and logic to fix, or null if passed",
+  "actionable_feedback": "Concrete instructions for Developer Agent detailing the exact files, functions, exports, imports, and logic to fix, or null if passed",
   "acceptance_criteria_results": [
     {"criterion": "string", "status": "SATISFIED" | "NOT_SATISFIED" | "UNKNOWN", "evidence": "string"}
   ]
@@ -235,18 +237,32 @@ class QAEngineerAgent:
         test_details: List[QATestResult] = []
         failure_type: Optional[str] = None
 
-        # 1. Detect Environment Errors
-        env_error_patterns = [
+        # 1. Detect missing runner binary (pure environment error)
+        runner_missing_patterns = [
             r"(?:'jest'|'vitest'|'mocha'|'pytest') is not recognized",
             r"(?:jest|vitest|mocha|pytest): (?:command not found|not found)",
-            r"Cannot find module ['\"]([^'\"]+)['\"]",
-            r"MODULE_NOT_FOUND",
             r"npm ERR! missing script:",
-            r"No such file or directory",
         ]
-        is_env_error = any(re.search(pat, full_text, re.IGNORECASE) for pat in env_error_patterns)
+        is_runner_missing = any(re.search(pat, full_text, re.IGNORECASE) for pat in runner_missing_patterns)
 
-        # 2. Detect "No Tests Found"
+        # 2. Check for missing module imports
+        missing_module_matches = re.findall(r"Cannot find module ['\"]([^'\"]+)['\"]", full_text, re.IGNORECASE)
+        # Any import starting with ., /, or \ is a local relative file import in the application code
+        local_missing_modules = [m for m in missing_module_matches if m.startswith((".", "/", "\\"))]
+        external_missing_modules = [m for m in missing_module_matches if not m.startswith((".", "/", "\\"))]
+
+        # 3. Detect code execution errors, syntax errors, and runtime crashes
+        code_error_patterns = [
+            r"Route\.\w+\(\) requires a callback function",
+            r"(?:TypeError|ReferenceError|SyntaxError|AssertionError|NameError|AttributeError|ImportError):",
+            r"UnhandledPromiseRejection",
+            r"● Test suite failed to run",
+            r"Cannot find module ['\"](\.{1,2}/[^'\"]+)['\"]",
+            r"FAIL\s+",
+        ]
+        has_code_error = any(re.search(pat, full_text) for pat in code_error_patterns) or bool(local_missing_modules)
+
+        # 4. Detect "No Tests Found"
         no_tests_patterns = [
             r"collected 0 items",
             r"no tests collected",
@@ -255,7 +271,7 @@ class QAEngineerAgent:
         ]
         is_no_tests = any(re.search(pat, full_text, re.IGNORECASE) for pat in no_tests_patterns)
 
-        # 3. Parse Jest output: "Tests: 1 failed, 7 passed, 8 total"
+        # 5. Parse Jest output: "Tests: 1 failed, 7 passed, 8 total"
         jest_match = re.search(
             r"Tests:\s*(?:(\d+)\s+failed,?\s*)?(?:(\d+)\s+skipped,?\s*)?(?:(\d+)\s+passed,?\s*)?(\d+)\s+total",
             full_text,
@@ -266,7 +282,7 @@ class QAEngineerAgent:
             skipped = int(jest_match.group(2) or 0)
             passed = int(jest_match.group(3) or 0)
         else:
-            # 4. Parse Pytest output: "5 passed, 1 failed, 2 skipped in 1.2s"
+            # 6. Parse Pytest output: "5 passed, 1 failed, 2 skipped in 1.2s"
             pytest_passed = re.search(r"(\d+)\s+passed", full_text)
             pytest_failed = re.search(r"(\d+)\s+failed", full_text)
             pytest_skipped = re.search(r"(\d+)\s+skipped", full_text)
@@ -277,7 +293,8 @@ class QAEngineerAgent:
 
         # Classify Failure Type
         if exit_code != 0 or failed > 0:
-            if is_env_error:
+            if is_runner_missing:
+                # ONLY if the test runner binary itself cannot be found in the system
                 failure_type = "ENVIRONMENT_ERROR"
                 if failed == 0 and passed == 0:
                     failed = 1
@@ -286,9 +303,34 @@ class QAEngineerAgent:
                 if failed == 0:
                     failed = 1
             else:
+                # All code crashes, missing imports (relative or package), syntax errors, and test assertions are code bugs
                 failure_type = "CODE_REGRESSION"
-                if exit_code != 0 and failed == 0 and passed == 0:
+                if failed == 0 and passed == 0:
                     failed = 1
+
+        # Extract specific error messages (e.g. Route.post() requires callback, Cannot find module, TypeError, etc.)
+        specific_errors = re.findall(
+            r"((?:Route\.\w+\(\)[^\n\r]+)|(?:Cannot find module ['\"][^'\"]+['\"][^\n\r]*)|(?:(?:TypeError|ReferenceError|SyntaxError|AssertionError|ImportError|NameError|AttributeError):[^\n\r]+))",
+            full_text,
+        )
+        primary_error_msg = specific_errors[0] if specific_errors else ""
+
+        # Extract code frame pointer (> 13 | ...)
+        code_frame_match = re.search(r">\s*(\d+)\s*\|\s*(.+)", full_text)
+        code_frame = f"line {code_frame_match.group(1)}: {code_frame_match.group(2).strip()}" if code_frame_match else ""
+
+        # Extract application source file locations from stack trace (excluding node_modules)
+        app_locations = re.findall(r"at\s+(?:.*?\()?([A-Za-z0-9_\-\./\\]+\.(?:js|ts|jsx|tsx|py):\d+:\d+)\)?", full_text)
+        app_locs = [loc for loc in app_locations if "node_modules" not in loc and not loc.startswith("internal/")]
+        source_locs = [loc for loc in app_locs if not re.search(r"(?:test|spec)\.", loc, re.IGNORECASE)]
+        target_loc = source_locs[0] if source_locs else (app_locs[0] if app_locs else "")
+
+        # Build enriched error description with location and code snippet
+        enriched_error_msg = primary_error_msg
+        if target_loc:
+            enriched_error_msg += f" in {target_loc}"
+        if code_frame:
+            enriched_error_msg += f" (Code: {code_frame})"
 
         # Extract specific failing test names (for Jest and Pytest)
         failing_names = re.findall(r"(?:FAIL|FAILED|✕|×|●)\s+([^\n\r]+)", full_text)
@@ -296,11 +338,21 @@ class QAEngineerAgent:
             clean_name = name.strip()
             if any(clean_name.startswith(w) for w in ["Test Suites:", "Tests:", "Snapshots:", "Time:"]):
                 continue
+            err_msg = enriched_error_msg if enriched_error_msg and clean_name == "Test suite failed to run" else (f"{clean_name}: {enriched_error_msg}" if enriched_error_msg else clean_name)
             test_details.append(
                 QATestResult(
-                    test_name=clean_name,
+                    test_name=clean_name if clean_name != "Test suite failed to run" or not enriched_error_msg else f"Test suite crash: {primary_error_msg}",
                     status="FAILED",
-                    error_message=clean_name,
+                    error_message=err_msg,
+                )
+            )
+
+        if not test_details and enriched_error_msg:
+            test_details.append(
+                QATestResult(
+                    test_name=f"Runtime error: {primary_error_msg[:80]}",
+                    status="FAILED",
+                    error_message=enriched_error_msg,
                 )
             )
 
@@ -360,8 +412,8 @@ class QAEngineerAgent:
         commands = self.discover_test_commands(workspace_path, plan)
         logger.info(f"QA Agent executing commands in {workspace_path}: {commands}")
 
-        # Pre-flight check: ensure dependencies exist
-        self.ensure_dependencies(workspace_path, commands)
+        # Pre-flight check: ensure dependencies exist (run in thread to avoid blocking event loop)
+        await asyncio.to_thread(self.ensure_dependencies, workspace_path, commands)
 
         all_passed = True
         total_passed = 0
@@ -412,16 +464,16 @@ class QAEngineerAgent:
         actionable_feedback = None
 
         if not all_passed:
-            is_all_env_errors = all(ft in ("ENVIRONMENT_ERROR", "NO_TESTS_FOUND") for ft in failure_types) if failure_types else False
+            is_all_env_errors = bool(failure_types) and all(ft == "ENVIRONMENT_ERROR" for ft in failure_types)
 
             if is_all_env_errors:
                 failure_summary = (
-                    f"Test environment configuration issue detected (exit codes: {exit_codes}). "
-                    f"Test runner or dependencies are not installed in workspace. No code regression was detected."
+                    f"Test runner binary or environment issue detected (exit codes: {exit_codes}). "
+                    f"The test runner executable could not be run."
                 )
                 actionable_feedback = (
-                    "Ensure repository package dependencies and test runner binaries are installed in the workspace. "
-                    "Do NOT modify application code logic or create tests in unrelated languages."
+                    f"The test runner command '{commands[0] if commands else 'test'}' failed to run. "
+                    "Verify that the test runner executable and workspace dependencies are correctly configured."
                 )
             else:
                 # Generate AI diagnosis for Developer Agent focused strictly on real code regressions
@@ -430,14 +482,20 @@ class QAEngineerAgent:
                     failure_summary += f" Failing items: {', '.join(t.test_name for t in all_test_details[:5])}."
 
                 try:
+                    failing_items_desc = "\n".join(
+                        f"- {t.test_name}: {t.error_message}" for t in all_test_details[:10]
+                    ) if all_test_details else "Check logs below."
                     prompt = (
                         f"Test execution failed.\n\n"
                         f"Commands executed: {commands}\n"
                         f"Exit codes: {exit_codes}\n"
-                        f"Failing tests: {[t.test_name for t in all_test_details]}\n"
-                        f"Execution Logs (truncated):\n{logs_str[-2500:]}\n\n"
+                        f"Failing tests / errors:\n{failing_items_desc}\n\n"
+                        f"Execution Logs (truncated):\n{logs_str[-3000:]}\n\n"
                         f"Produce the JSON diagnosis and actionable feedback for the Developer Agent. "
-                        f"Target ONLY the failing application code files. Do NOT suggest adding tests in other languages."
+                        f"Target ONLY the failing application code files and imports. "
+                        f"If the error is a missing local module (e.g. Cannot find module), wrong import path, "
+                        f"missing export, or undefined callback function, explicitly instruct the Developer Agent "
+                        f"which file to modify, which exact import/export path to correct, and authorize them to fix it."
                     )
                     response = await self.provider.chat_completion(
                         messages=[
@@ -455,7 +513,10 @@ class QAEngineerAgent:
                         crit_results = [AcceptanceCriterionResult(**item) for item in data["acceptance_criteria_results"]]
                 except Exception as e:
                     logger.warning(f"QA LLM evaluation fallback: {e}")
-                    actionable_feedback = f"Investigate test failures in {commands}. Inspect logs:\n{stderr_str[:500]}"
+                    failing_items_desc = "\n".join(
+                        f"- {t.test_name}: {t.error_message}" for t in all_test_details[:10]
+                    ) if all_test_details else "See logs."
+                    actionable_feedback = f"Investigate test failures in {commands}. Failing items:\n{failing_items_desc}\nInspect logs:\n{stderr_str[:500]}"
 
         return QAOutput(
             test_execution_id=test_execution_id,

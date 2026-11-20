@@ -58,3 +58,4 @@ def test_sanitize_env_preserves_utf8_encoding_variables():
 
     assert clean_env.get("PYTHONIOENCODING") == "utf-8"
     assert clean_env.get("PYTHONUTF8") == "1"
+

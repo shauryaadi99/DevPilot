@@ -125,11 +125,14 @@ class SandboxService:
         safe_keys = {
             "PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "USERPROFILE",
             "HOME", "LANG", "LC_ALL", "PYTHONIOENCODING", "PYTHONUTF8",
+            # Windows-required for npm/node: cache dir, local app data, system drive, shell
+            "APPDATA", "LOCALAPPDATA", "SYSTEMDRIVE", "COMSPEC",
         }
         clean_env: Dict[str, str] = {}
         for k, v in os.environ.items():
             if k.upper() in safe_keys and k.upper() not in FORBIDDEN_ENV_KEYS:
-                clean_env[k] = v
+                # Normalize key to uppercase so case-mixed Windows env vars are passed correctly
+                clean_env[k.upper()] = v
 
         clean_env.setdefault("PYTHONIOENCODING", "utf-8")
         clean_env.setdefault("PYTHONUTF8", "1")
@@ -138,7 +141,7 @@ class SandboxService:
         if custom_env:
             for k, v in custom_env.items():
                 if k.upper() not in FORBIDDEN_ENV_KEYS:
-                    clean_env[k] = v
+                    clean_env[k.upper()] = v
                 else:
                     logger.warning(f"Forbidden environment key '{k}' stripped from sandbox execution.")
 

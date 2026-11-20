@@ -21,15 +21,19 @@ You receive ONE implementation step at a time with its context and produce the e
 
 Rules (CRITICAL):
 - Output ONLY valid JSON. No prose, no markdown fences, no explanations outside JSON.
-- JSON schema: {"file_path": "relative/path", "content": "<full file content as string>", "explanation": "<1 sentence>"}
+- JSON schema for single-file step: {"file_path": "relative/path", "content": "<full file content as string>", "explanation": "<1 sentence>"}
+- JSON schema for multi-file step: [{"file_path": "relative/path", "content": "<full file content as string>", "explanation": "<1 sentence>"}, ...]
+- If a step lists multiple affected files, you MUST implement ALL of them and output a JSON array of file objects.
 - Write the COMPLETE file content — not a diff, not a snippet.
 - Respect existing code style, indentation, imports, and naming conventions.
-- Reuse existing utilities/patterns; do not introduce unnecessary dependencies.
-- If the step requires modifying an existing file, include ALL original content plus your changes.
+- When importing packages, check existing package manifests (e.g. package.json dependencies like bcryptjs vs bcrypt) and import only packages installed in the project.
+- NEVER require() or import any external third-party package (e.g. nodemailer, express-rate-limit, redis) that is not already listed in package.json. Implement lightweight in-memory implementations (e.g. JavaScript Map/Set) or built-in standard libraries instead.
+- When modifying existing files, PRESERVE all existing routes, middleware, handlers, and exports unless explicitly asked to remove them. Never discard existing functionality.
+- Ensure import paths and exported names match other modules exactly (e.g. if a controller exports requestPasswordReset, do not import forgotPassword).
 - If the step creates a new file, write the full new file.
 - explanation: 1 sentence max, describes what you did and why."""
 
-FALLBACK_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
+FALLBACK_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
 
 
 @dataclass
@@ -149,45 +153,105 @@ class DeveloperAgent:
         step_title = step.title if hasattr(step, "title") else f"Step {step_num}"
         affected = step.affected_files if hasattr(step, "affected_files") and step.affected_files else []
         description = step.description if hasattr(step, "description") else str(step)
+        target_file = affected[0] if affected else None
 
-        # Read existing file contents for context
+        # Read existing file contents for context (capped per file)
         existing_contents: Dict[str, str] = {}
         for fp in affected:
             read_result = fs.read_file(fp)
             if "content" in read_result:
-                existing_contents[fp] = read_result["content"]
+                c = read_result["content"]
+                existing_contents[fp] = c[:5000] if len(c) > 5000 else c
 
-        # Determine primary file target from plan
-        target_file = affected[0] if affected else None
+        # Context awareness: also include newly created controllers/services/models from this plan
+        # so later steps (e.g. routes, frontend, tests) know the exact filenames and exported functions
+        for fc in (plan.files_to_create or []):
+            fc_path = getattr(fc, "path", None) or (fc.get("path") if isinstance(fc, dict) else None)
+            if fc_path and fc_path != target_file and fc_path not in existing_contents:
+                if fs.file_exists(fc_path):
+                    read_result = fs.read_file(fc_path)
+                    if "content" in read_result:
+                        c = read_result["content"]
+                        existing_contents[fc_path] = c[:2000] if len(c) > 2000 else c
+
+        # Load package manifests in summary form (only dependency names) to save tokens
+        for manifest_candidate in ["package.json", "backend/package.json", "frontend/package.json"]:
+            if fs.file_exists(manifest_candidate):
+                m_res = fs.read_file(manifest_candidate)
+                if "content" in m_res:
+                    try:
+                        pdata = json.loads(m_res["content"])
+                        dep_list = list(pdata.get("dependencies", {}).keys()) + list(pdata.get("devDependencies", {}).keys())
+                        existing_contents[f"{manifest_candidate} (installed packages)"] = f"Installed packages: {', '.join(dep_list)}"
+                    except Exception:
+                        existing_contents[manifest_candidate] = m_res["content"][:1000]
+                break
+
+        # If feedback mentions specific files, load them into context as well (capped)
+        if feedback:
+            import re
+            mentioned_files = re.findall(r"[\w\-\./\\]+\.(?:js|jsx|ts|tsx|py|json)", feedback)
+            for mf in mentioned_files[:2]:
+                for cand in [mf, f"backend/{mf}", f"frontend/{mf}"]:
+                    if cand not in existing_contents and fs.file_exists(cand):
+                        read_res = fs.read_file(cand)
+                        if "content" in read_res:
+                            c = read_res["content"]
+                            existing_contents[cand] = c[:2000] if len(c) > 2000 else c
+                            break
 
         # Check if file should be created or modified
         create_paths = {f.path for f in plan.files_to_create if hasattr(f, "path")}
         change_type = "CREATE" if target_file and target_file in create_paths else "MODIFY"
 
-        # Build LLM prompt
+        # Build LLM prompt with strict overall budget to stay safely within Groq TPM limits
         context_parts = []
+        total_chars = 0
+        max_context_chars = 8000
         for fp, content in existing_contents.items():
-            # Cap each file at 3000 chars to stay within token budget
-            snippet = content[:3000] + ("...[truncated]" if len(content) > 3000 else "")
-            context_parts.append(f"=== {fp} ===\n{snippet}")
+            if total_chars + len(content) > max_context_chars:
+                remaining = max(0, max_context_chars - total_chars)
+                if remaining > 200:
+                    context_parts.append(f"=== {fp} (summary) ===\n{content[:remaining]}")
+                break
+            context_parts.append(f"=== {fp} ===\n{content}")
+            total_chars += len(content)
 
         context_str = "\n\n".join(context_parts) if context_parts else "(no existing files — create new)"
+
+        # Instructions depending on single or multiple affected files
+        if len(affected) > 1:
+            files_desc = "\n".join(f"- {f}" for f in affected)
+            step_target_info = (
+                f"Affected files for this step ({len(affected)} files):\n{files_desc}\n"
+                f"You MUST implement and output ALL of these affected files as a JSON array of objects: "
+                f"[{{\"file_path\": \"...\", \"content\": \"...\", \"explanation\": \"...\"}}, ...]"
+            )
+        else:
+            step_target_info = (
+                f"Target file: {target_file or 'determine from description'}\n"
+                f"Change type: {change_type}\n"
+                f"Output JSON: {{\"file_path\": \"...\", \"content\": \"...\", \"explanation\": \"...\"}}"
+            )
 
         # Key files overview from plan (brief)
         plan_summary = (
             f"Task: {plan.summary[:200]}\n"
             f"Step {step_num}: {step_title}\n"
             f"Description: {description}\n"
-            f"Target file: {target_file or 'determine from description'}\n"
-            f"Change type: {change_type}"
+            f"{step_target_info}"
         )
         if feedback:
-            plan_summary += f"\nCORRECTIVE FEEDBACK FROM QA / REVIEW:\n{feedback}\nPlease address and correct these specific issues in this step."
+            feedback_excerpt = feedback[:1500] if len(feedback) > 1500 else feedback
+            plan_summary += (
+                f"\n\nCORRECTIVE FEEDBACK FROM QA / TESTS / REVIEW:\n{feedback_excerpt}\n"
+                f"Please address and correct these exact issues in this step. Fix any broken imports, missing exports, or undefined callbacks. Never import uninstalled packages."
+            )
 
         user_prompt = (
             f"{plan_summary}\n\n"
-            f"Existing file content:\n{context_str}\n\n"
-            "Output JSON only: {\"file_path\": \"...\", \"content\": \"...\", \"explanation\": \"...\"}"
+            f"Existing file content & dependencies:\n{context_str}\n\n"
+            f"Generate the full file contents now in JSON format."
         )
 
         # Try models with fallback
@@ -210,6 +274,28 @@ class DeveloperAgent:
             except Exception as exc:
                 last_error = str(exc)
                 logger.warning(f"Developer Agent model {model} failed: {exc}")
+                # Resilient recovery: if Groq truncated JSON, check for failed_generation in error payload
+                try:
+                    err_body = getattr(exc, "body", None) or {}
+                    if isinstance(err_body, dict):
+                        failed_gen = err_body.get("error", {}).get("failed_generation")
+                        if failed_gen:
+                            try:
+                                json.loads(failed_gen)
+                                raw_output = failed_gen
+                                break
+                            except Exception:
+                                for suffix in ['"}', '"}\n}', '"} }', '"}']:
+                                    try:
+                                        json.loads(failed_gen + suffix)
+                                        raw_output = failed_gen + suffix
+                                        break
+                                    except Exception:
+                                        pass
+                                if raw_output:
+                                    break
+                except Exception:
+                    pass
                 continue
 
         if not raw_output:
@@ -222,62 +308,104 @@ class DeveloperAgent:
         # Parse LLM output
         try:
             parsed = json.loads(raw_output)
-            file_path = parsed.get("file_path", target_file or "").strip()
-            content = parsed.get("content", "")
-            explanation = parsed.get("explanation", "")
-        except json.JSONDecodeError as exc:
+        except Exception as exc:
             return StepResult(
                 step_number=step_num, step_title=step_title,
                 file_path=target_file or "", change_type=change_type,
                 success=False, explanation="", error=f"JSON parse error: {exc}",
             )
 
-        if not file_path or not content:
+        # Normalize parsed output into a list of file items (handles dict, list of dicts, or dict with 'files'/'changes')
+        items: List[Dict[str, Any]] = []
+        if isinstance(parsed, list):
+            items = [item for item in parsed if isinstance(item, dict)]
+        elif isinstance(parsed, dict):
+            if "files" in parsed and isinstance(parsed["files"], list):
+                items = [item for item in parsed["files"] if isinstance(item, dict)]
+            elif "changes" in parsed and isinstance(parsed["changes"], list):
+                items = [item for item in parsed["changes"] if isinstance(item, dict)]
+            else:
+                items = [parsed]
+        else:
             return StepResult(
                 step_number=step_num, step_title=step_title,
-                file_path=file_path or "", change_type=change_type,
-                success=False, explanation=explanation,
-                error="LLM returned empty file_path or content.",
+                file_path=target_file or "", change_type=change_type,
+                success=False, explanation="",
+                error=f"Unexpected LLM output format: expected dict or list, got {type(parsed).__name__}",
             )
 
-        # Apply change via filesystem tools
-        try:
-            if change_type == "CREATE" and not fs.file_exists(file_path):
-                result = fs.create_file(file_path, content)
-            else:
-                result = fs.upsert_file(file_path, content)
+        if not items:
+            return StepResult(
+                step_number=step_num, step_title=step_title,
+                file_path=target_file or "", change_type=change_type,
+                success=False, explanation="",
+                error="LLM output did not contain any valid file change objects.",
+            )
 
-            if "error" in result:
+        applied_paths: List[str] = []
+        total_added = 0
+        total_removed = 0
+        explanations: List[str] = []
+
+        for item in items:
+            item_path = str(item.get("file_path") or item.get("path") or target_file or "").strip()
+            item_content = item.get("content", "")
+            item_exp = str(item.get("explanation") or "").strip()
+            if item_exp:
+                explanations.append(item_exp)
+
+            if not item_path or not item_content:
+                continue
+
+            try:
+                item_create = (change_type == "CREATE" and not fs.file_exists(item_path))
+                if item_create:
+                    res = fs.create_file(item_path, item_content)
+                else:
+                    res = fs.upsert_file(item_path, item_content)
+
+                if "error" in res:
+                    return StepResult(
+                        step_number=step_num, step_title=step_title,
+                        file_path=item_path, change_type=change_type,
+                        success=False, explanation="; ".join(explanations), error=res["error"],
+                    )
+
+                applied_paths.append(item_path)
+                old_lines = len(existing_contents.get(item_path, "").splitlines())
+                new_lines = len(item_content.splitlines())
+                total_added += max(0, new_lines - old_lines)
+                total_removed += max(0, old_lines - new_lines)
+
+            except FilesystemSecurityError as exc:
                 return StepResult(
                     step_number=step_num, step_title=step_title,
-                    file_path=file_path, change_type=change_type,
-                    success=False, explanation=explanation, error=result["error"],
+                    file_path=item_path, change_type=change_type,
+                    success=False, explanation="", error=f"Security violation: {exc}",
+                )
+            except Exception as exc:
+                return StepResult(
+                    step_number=step_num, step_title=step_title,
+                    file_path=item_path, change_type=change_type,
+                    success=False, explanation="", error=f"Unexpected error: {exc}",
                 )
 
-            # Rough diff accounting
-            old_lines = len(existing_contents.get(file_path, "").splitlines())
-            new_lines = len(content.splitlines())
-            lines_added = max(0, new_lines - old_lines)
-            lines_removed = max(0, old_lines - new_lines)
-
+        if not applied_paths:
             return StepResult(
                 step_number=step_num, step_title=step_title,
-                file_path=file_path, change_type=result.get("status", change_type).upper(),
-                success=True, explanation=explanation,
-                lines_added=lines_added, lines_removed=lines_removed,
-                diff_summary=f"+{lines_added} -{lines_removed} lines",
+                file_path=target_file or "", change_type=change_type,
+                success=False, explanation="; ".join(explanations),
+                error="LLM returned empty file_path or content in all items.",
             )
 
-        except FilesystemSecurityError as exc:
-            return StepResult(
-                step_number=step_num, step_title=step_title,
-                file_path=file_path, change_type=change_type,
-                success=False, explanation="", error=f"Security violation: {exc}",
-            )
-        except Exception as exc:
-            return StepResult(
-                step_number=step_num, step_title=step_title,
-                file_path=file_path, change_type=change_type,
-                success=False, explanation="", error=f"Unexpected error: {exc}",
-            )
+        primary_path = applied_paths[0]
+        combined_explanation = "; ".join(explanations) if explanations else f"Applied changes to {', '.join(applied_paths)}"
+
+        return StepResult(
+            step_number=step_num, step_title=step_title,
+            file_path=primary_path, change_type=change_type,
+            success=True, explanation=combined_explanation,
+            lines_added=total_added, lines_removed=total_removed,
+            diff_summary=f"+{total_added} -{total_removed} lines ({len(applied_paths)} file(s))",
+        )
 

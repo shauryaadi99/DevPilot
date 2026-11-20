@@ -20,8 +20,78 @@ except ImportError:
     APIError = Exception  # type: ignore
 
 
+class GroqCompletionsWrapper:
+    """Wrapper around client.chat.completions to transparently handle key failover."""
+
+    def __init__(self, provider: "GroqProvider"):
+        self._provider = provider
+
+    def create(self, *args, **kwargs) -> Any:
+        keys = self._provider.get_available_keys()
+        if not keys:
+            raise ValueError("No Groq API keys configured.")
+
+        last_error = None
+        for idx, key in enumerate(keys):
+            client = self._provider._get_raw_client(key)
+            try:
+                return client.chat.completions.create(*args, **kwargs)
+            except (AuthenticationError, RateLimitError, APITimeoutError, APIError) as exc:
+                last_error = exc
+                masked_key = f"...{key[-4:]}" if len(key) >= 4 else "key"
+                if idx + 1 < len(keys):
+                    next_key = keys[idx + 1]
+                    next_masked = f"...{next_key[-4:]}" if len(next_key) >= 4 else "next_key"
+                    logger.warning(
+                        f"Groq API call with key {masked_key} encountered {exc.__class__.__name__}: {exc}. "
+                        f"Automatically failing over to fallback key {next_masked}."
+                    )
+                else:
+                    logger.error(f"Groq API call failed across all {len(keys)} available key(s): {exc}")
+                    raise
+            except Exception as exc:
+                status_code = getattr(exc, "status_code", None)
+                is_rate_or_size = status_code in (401, 413, 429, 500, 502, 503) or "rate_limit" in str(exc).lower() or "too large" in str(exc).lower()
+                if is_rate_or_size and idx + 1 < len(keys):
+                    masked_key = f"...{key[-4:]}" if len(key) >= 4 else "key"
+                    next_key = keys[idx + 1]
+                    next_masked = f"...{next_key[-4:]}" if len(next_key) >= 4 else "next_key"
+                    logger.warning(
+                        f"Groq API call status {status_code} with key {masked_key}: {exc}. "
+                        f"Failing over to fallback key {next_masked}."
+                    )
+                    last_error = exc
+                    continue
+                raise
+
+        if last_error:
+            raise last_error
+
+
+class GroqChatWrapper:
+    def __init__(self, provider: "GroqProvider"):
+        self.completions = GroqCompletionsWrapper(provider)
+
+
+class GroqClientWrapper:
+    """Smart Groq SDK client wrapper with automatic multi-key failover."""
+
+    def __init__(self, provider: "GroqProvider"):
+        self._provider = provider
+        self.chat = GroqChatWrapper(provider)
+
+    def __getattr__(self, name: str) -> Any:
+        # Delegate any other attributes (e.g. models, embeddings) to the active raw client
+        keys = self._provider.get_available_keys()
+        primary_key = keys[0] if keys else None
+        if not primary_key:
+            raise ValueError("No Groq API keys configured.")
+        active_client = self._provider._get_raw_client(primary_key)
+        return getattr(active_client, name)
+
+
 class GroqProvider:
-    """Encapsulated Groq LLM client."""
+    """Encapsulated Groq LLM client with automatic fallback key support."""
 
     def __init__(
         self,
@@ -32,32 +102,50 @@ class GroqProvider:
         settings = get_settings()
         self._explicit_key = api_key is not None
         self.api_key = api_key if self._explicit_key else settings.GROQ_API_KEY
+        self.fallback_api_key = settings.GROQ_API_FALLBACK_KEY
         self.model = model or settings.GROQ_MODEL
         self.timeout = timeout or settings.GROQ_TIMEOUT_SECONDS
-        self._client: Optional[Any] = None
+        self._raw_clients: Dict[str, Any] = {}
+        self._wrapper_client: Optional[GroqClientWrapper] = None
+
+    def get_available_keys(self) -> list[str]:
+        """Return list of configured Groq API keys in priority order (primary, then fallback)."""
+        keys: list[str] = []
+        if self._explicit_key:
+            if self.api_key and self.api_key.strip() and self.api_key != "your_groq_api_key_here":
+                keys.append(self.api_key.strip())
+            return keys
+
+        settings = get_settings()
+        if not settings.GROQ_API_KEY:
+            settings = get_settings(reload=True)
+        for k in [settings.GROQ_API_KEY, settings.GROQ_API_FALLBACK_KEY]:
+            if k and k.strip() and k != "your_groq_api_key_here" and k not in keys:
+                keys.append(k.strip())
+        return keys
 
     @property
     def is_configured(self) -> bool:
-        """Check whether valid credentials are provided."""
-        if not self._explicit_key and (not self.api_key or self.api_key.strip() == "" or self.api_key == "your_groq_api_key_here"):
-            fresh_settings = get_settings(reload=True)
-            if fresh_settings.GROQ_API_KEY and fresh_settings.GROQ_API_KEY.strip() and fresh_settings.GROQ_API_KEY != "your_groq_api_key_here":
-                self.api_key = fresh_settings.GROQ_API_KEY
-                self.model = fresh_settings.GROQ_MODEL
-                self.timeout = fresh_settings.GROQ_TIMEOUT_SECONDS
-                self._client = None
+        """Check whether at least one valid API key is configured."""
+        return len(self.get_available_keys()) > 0
 
-        return bool(self.api_key and self.api_key.strip() and self.api_key != "your_groq_api_key_here")
+    def _get_raw_client(self, key: str) -> Any:
+        """Get or initialize a raw Groq SDK client for a specific API key."""
+        if not GROQ_SDK_AVAILABLE:
+            raise RuntimeError("Groq Python SDK is not installed.")
+        if key not in self._raw_clients:
+            self._raw_clients[key] = Groq(api_key=key, timeout=self.timeout)
+        return self._raw_clients[key]
 
     def _get_client(self) -> Any:
-        """Lazy-initialize and return the Groq SDK client."""
+        """Return the resilient GroqClientWrapper supporting automatic key failover."""
         if not GROQ_SDK_AVAILABLE:
             raise RuntimeError("Groq Python SDK is not installed.")
         if not self.is_configured:
             raise ValueError("GROQ_API_KEY is not configured or contains placeholder value.")
-        if self._client is None:
-            self._client = Groq(api_key=self.api_key, timeout=self.timeout)
-        return self._client
+        if self._wrapper_client is None:
+            self._wrapper_client = GroqClientWrapper(self)
+        return self._wrapper_client
 
     def test_connection(self) -> Dict[str, Any]:
         """Perform a safe, minimal connectivity test against Groq Cloud.

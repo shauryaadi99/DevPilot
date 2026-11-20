@@ -140,3 +140,80 @@ def test_compute_failure_signature_deterministic():
     diff_tests = [QATestResult(test_name="different_test", status="FAILED")]
     sig3 = agent.compute_failure_signature([1], diff_tests, "SyntaxError: unexpected token")
     assert sig1 != sig3
+
+
+def test_parse_test_output_missing_relative_module_is_code_regression():
+    """Verify that local relative missing modules are classified as CODE_REGRESSION, not ENVIRONMENT_ERROR."""
+    agent = QAEngineerAgent()
+    stderr = """
+FAIL tests/auth.test.js
+  ● Test suite failed to run
+
+    Cannot find module '../src/controllers/auth' from 'tests/auth.test.js'
+"""
+    result = agent.parse_test_output("npm test", 1, "", stderr)
+    assert result["failure_type"] == "CODE_REGRESSION"
+    assert result["failed"] == 1
+    assert any("Cannot find module" in (t.error_message or "") for t in result["test_details"])
+
+
+def test_parse_test_output_route_callback_undefined_is_code_regression():
+    """Verify that undefined route callbacks (express runtime errors) are classified as CODE_REGRESSION."""
+    agent = QAEngineerAgent()
+    stderr = """
+FAIL tests/task.test.js
+  ● Test suite failed to run
+
+    Route.post() requires a callback function but got a [object Undefined]
+
+       7 | router.post('/login', loginUser);
+       8 | router.get('/me', protect, getMe);
+    >  9 | router.post('/forgot-password', forgotPassword);
+         |        ^
+"""
+    result = agent.parse_test_output("npm test", 1, "", stderr)
+    assert result["failure_type"] == "CODE_REGRESSION"
+    assert result["failed"] == 1
+    assert any("requires a callback function" in (t.error_message or "") for t in result["test_details"])
+
+
+def test_parse_test_output_missing_package_module_is_code_regression():
+    """Verify that missing package imports (e.g. bcrypt) are classified as CODE_REGRESSION."""
+    agent = QAEngineerAgent()
+    stderr = """
+FAIL tests/auth.test.js
+  ● Test suite failed to run
+
+    Cannot find module 'bcrypt' from 'src/controllers/passwordResetController.js'
+"""
+    result = agent.parse_test_output("npm test", 1, "", stderr)
+    assert result["failure_type"] == "CODE_REGRESSION"
+    assert result["failed"] == 1
+    assert any("Cannot find module 'bcrypt'" in (t.error_message or "") for t in result["test_details"])
+
+
+def test_parse_test_output_enriches_error_with_file_and_code_frame():
+    """Verify that test output parsing extracts source location and code frame pointer."""
+    agent = QAEngineerAgent()
+    stderr = """
+FAIL tests/task.test.js
+  ● Test suite failed to run
+
+    Route.post() requires a callback function but got a [object Undefined]
+
+      11 |
+      12 | // Request password reset token
+    > 13 | router.post('/forgot-password', forgotPassword);
+         |        ^
+
+      at Route.<computed> [as post] (node_modules/express/lib/router/route.js:216:15)
+      at Object.post (src/routes/authRoutes.js:13:8)
+      at Object.require (src/app.js:3:20)
+      at Object.require (tests/task.test.js:3:13)
+"""
+    result = agent.parse_test_output("npm test", 1, "", stderr)
+    assert result["failed"] == 1
+    err_msg = result["test_details"][0].error_message
+    assert "src/routes/authRoutes.js:13:8" in err_msg
+    assert "router.post('/forgot-password', forgotPassword)" in err_msg
+

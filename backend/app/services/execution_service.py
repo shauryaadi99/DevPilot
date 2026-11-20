@@ -231,6 +231,25 @@ async def node_execute(state: ExecutionState) -> ExecutionState:
     mode_desc = f"with feedback: {feedback[:80]}..." if feedback else "initial implementation"
     logger.info(f"[{task_id}] Starting Developer Agent execution ({mode_desc})")
 
+    # Write intermediate DB status so polling UI shows EXECUTING immediately
+    try:
+        from app.db.session import SessionLocal
+        with SessionLocal() as _db:
+            from app.db.models import Task as _Task, TaskExecution as _TaskExecution
+            _exec = _db.query(_TaskExecution).filter(_TaskExecution.id == state["execution_id"]).first()
+            _task = _db.query(_Task).filter(_Task.id == task_id).first()
+            if _exec:
+                _exec.status = "EXECUTING"
+                if state.get("workspace_path"):
+                    _exec.workspace_path = state["workspace_path"]
+                if state.get("branch_name"):
+                    _exec.branch_name = state["branch_name"]
+            if _task:
+                _task.status = "EXECUTING"
+            _db.commit()
+    except Exception as _e:
+        logger.warning(f"[{task_id}] Could not write intermediate EXECUTING status: {_e}")
+
     plan_dict = state["plan"]
     try:
         plan = ArchitectPlanOutput(
@@ -301,6 +320,21 @@ async def node_commit(state: ExecutionState) -> ExecutionState:
     workspace = Path(state["workspace_path"])
     logger.info(f"[{task_id}] Committing changes to branch {state['branch_name']}")
 
+    # Write intermediate DB status so polling UI shows COMMITTING immediately
+    try:
+        from app.db.session import SessionLocal
+        with SessionLocal() as _db:
+            from app.db.models import Task as _Task, TaskExecution as _TaskExecution
+            _exec = _db.query(_TaskExecution).filter(_TaskExecution.id == state["execution_id"]).first()
+            _task = _db.query(_Task).filter(_Task.id == task_id).first()
+            if _exec:
+                _exec.status = "COMMITTING"
+            if _task:
+                _task.status = "EXECUTING"
+            _db.commit()
+    except Exception as _e:
+        logger.warning(f"[{task_id}] Could not write intermediate COMMITTING status: {_e}")
+
     def _do_commit():
         repo = Repo(str(workspace))
         if not repo.is_dirty(untracked_files=True):
@@ -323,18 +357,58 @@ async def node_commit(state: ExecutionState) -> ExecutionState:
 
 async def node_qa(state: ExecutionState) -> ExecutionState:
     """Run QA Engineer Agent tests within the isolated workspace."""
+    from app.db.session import SessionLocal
     task_id = state["task_id"]
     workspace = Path(state["workspace_path"])
     qa_cycle = (state.get("qa_cycle") or 0) + 1
     logger.info(f"[{task_id}] Starting QA cycle {qa_cycle}")
 
+    # Ensure workspace exists before running QA tests
+    if not workspace.exists() or not workspace.is_dir():
+        logger.info(f"[{task_id}] Workspace {workspace} missing on disk; preparing workspace before QA...")
+        from app.services.git_service import prepare_task_workspace
+        workspace = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: prepare_task_workspace(
+                clone_url=state["repo_clone_url"],
+                task_id=task_id,
+                github_token=state.get("github_token"),
+                default_branch=state.get("default_branch") or "main",
+            )
+        )
+
+    # Write intermediate DB status so UI shows QA_TESTING immediately
+    try:
+        with SessionLocal() as _db:
+            from app.db.models import Task as _Task, TaskExecution as _TaskExecution
+            _exec = _db.query(_TaskExecution).filter(_TaskExecution.id == state["execution_id"]).first()
+            _task = _db.query(_Task).filter(_Task.id == task_id).first()
+            if _exec:
+                _exec.status = "QA_TESTING"
+            if _task:
+                _task.status = "QA_TESTING"
+            _db.commit()
+    except Exception as _e:
+        logger.warning(f"[{task_id}] Could not write intermediate QA_TESTING status: {_e}")
+
+    # Reconstruct plan using explicit field mapping (same pattern as node_execute)
     plan_data = state.get("plan")
     plan_obj = None
     if plan_data:
         try:
-            plan_obj = ArchitectPlanOutput(**plan_data)
-        except Exception:
-            pass
+            plan_obj = ArchitectPlanOutput(
+                summary=plan_data.get("summary", ""),
+                repository_understanding=plan_data.get("repository_understanding", ""),
+                confirmed_observations=plan_data.get("confirmed_observations", []),
+                files_to_create=[FileToCreate(**f) for f in plan_data.get("files_to_create", [])],
+                files_to_modify=[FileToModify(**f) for f in plan_data.get("files_to_modify", [])],
+                implementation_steps=[ImplementationStep(**s) for s in plan_data.get("implementation_steps", [])],
+                dependencies=plan_data.get("dependencies", []),
+                testing_strategy=plan_data.get("testing_strategy", {}),
+                risks_and_assumptions=plan_data.get("risks_and_assumptions", []),
+            )
+        except Exception as exc:
+            logger.warning(f"[{task_id}] Plan reconstruction in node_qa failed: {exc}; proceeding without plan hints.")
 
     qa_agent = QAEngineerAgent()
     prev_sig = (state.get("failure_history") or [])[-1] if state.get("failure_history") else None
@@ -409,6 +483,13 @@ def node_qa_exhausted(state: ExecutionState) -> ExecutionState:
 def node_prepare_dev_retry(state: ExecutionState) -> ExecutionState:
     qa_res = state.get("qa_result") or {}
     feedback = qa_res.get("actionable_feedback") or qa_res.get("failure_summary") or "Fix failing tests."
+
+    # Append concrete failing test details so Developer Agent sees the exact file, line, and code frame
+    failing_items = qa_res.get("test_details") or []
+    if failing_items:
+        details_lines = [f"- {t.get('test_name', '')}: {t.get('error_message', '')}" for t in failing_items[:10]]
+        feedback += "\n\nExact Failing Test Traces:\n" + "\n".join(details_lines)
+
     return {
         **state,
         "status": "EXECUTING",
@@ -418,10 +499,39 @@ def node_prepare_dev_retry(state: ExecutionState) -> ExecutionState:
 
 async def node_review(state: ExecutionState) -> ExecutionState:
     """Run Code Reviewer Agent on Git diff against base branch."""
+    from app.db.session import SessionLocal
     task_id = state["task_id"]
     workspace = Path(state["workspace_path"])
     review_cycle = (state.get("review_cycle") or 0) + 1
     logger.info(f"[{task_id}] Starting Code Review cycle {review_cycle}")
+
+    # Ensure workspace exists before running Code Review
+    if not workspace.exists() or not workspace.is_dir():
+        logger.info(f"[{task_id}] Workspace {workspace} missing on disk; preparing workspace before Code Review...")
+        from app.services.git_service import prepare_task_workspace
+        workspace = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: prepare_task_workspace(
+                clone_url=state["repo_clone_url"],
+                task_id=task_id,
+                github_token=state.get("github_token"),
+                default_branch=state.get("default_branch") or "main",
+            )
+        )
+
+    # Write intermediate DB status so UI shows REVIEWING immediately
+    try:
+        with SessionLocal() as _db:
+            from app.db.models import Task as _Task, TaskExecution as _TaskExecution
+            _exec = _db.query(_TaskExecution).filter(_TaskExecution.id == state["execution_id"]).first()
+            _task = _db.query(_Task).filter(_Task.id == task_id).first()
+            if _exec:
+                _exec.status = "REVIEWING"
+            if _task:
+                _task.status = "REVIEWING"
+            _db.commit()
+    except Exception as _e:
+        logger.warning(f"[{task_id}] Could not write intermediate REVIEWING status: {_e}")
 
     reviewer = CodeReviewerAgent()
     plan_dict = state.get("plan") or {}
@@ -681,7 +791,13 @@ class ExecutionService:
             raise RuntimeError("Task execution is already running on another worker.")
 
         completed_steps = [
-            log.step_number for log in execution.logs if log.agent == "DeveloperAgent" and log.level == "INFO"
+            log.step_number
+            for log in execution.logs
+            if log.agent == "DeveloperAgent"
+            and log.level == "INFO"
+            and log.step_number is not None
+            and log.step_number > 0
+            and (execution.total_steps is None or log.step_number <= execution.total_steps)
         ]
 
         plan_data = None
@@ -709,13 +825,13 @@ class ExecutionService:
             "completed_steps": completed_steps,
             "user_requirement": task.user_requirement,
             "acceptance_criteria": criteria,
-            "qa_cycle": len(execution.qa_reports),
+            "qa_cycle": 0 if (len(execution.qa_reports) >= 3 or execution.status == "FAILED") else len(execution.qa_reports),
             "max_qa_cycles": 3,
-            "review_cycle": len(execution.review_reports),
+            "review_cycle": 0 if (len(execution.review_reports) >= 2 or execution.status == "FAILED") else len(execution.review_reports),
             "max_review_cycles": 2,
             "qa_result": None,
             "review_result": None,
-            "failure_history": [r.failure_signature for r in execution.qa_reports if r.failure_signature],
+            "failure_history": [] if (len(execution.qa_reports) >= 3 or execution.status == "FAILED") else [r.failure_signature for r in execution.qa_reports if r.failure_signature],
             "feedback_for_developer": None,
             "qa_reports_data": [],
             "review_reports_data": [],
@@ -739,6 +855,112 @@ class ExecutionService:
             release_execution_lock(db, task.id, lock_token)
 
         self._persist_results(db, task, execution, final_state)
+
+    async def run_qa_pipeline(
+        self,
+        db: Session,
+        task: Task,
+        execution: TaskExecution,
+        github_token: Optional[str] = None,
+    ) -> None:
+        """Start QA pipeline directly from QA_TESTING node — bypasses VALIDATING/CLONING/EXECUTING.
+
+        Called by the /run-qa endpoint when a task is AWAITING_QA but QA has not yet run
+        (i.e. the inline pipeline completed COMMITTING but was interrupted before QA, or the
+        user manually triggers QA for the first time on a task with a committed workspace).
+        """
+        lock_token = acquire_execution_lock(db, task.id, execution.id)
+        if not lock_token:
+            raise RuntimeError("Task execution is already running on another worker.")
+
+        plan_data = None
+        if task.implementation_plan:
+            plan_data = task.implementation_plan.__dict__.copy()
+            plan_data.pop("_sa_instance_state", None)
+
+        criteria: List[str] = []
+        if task.requirement_analysis and task.requirement_analysis.acceptance_criteria:
+            criteria = list(task.requirement_analysis.acceptance_criteria)
+
+        qa_state: ExecutionState = {
+            "task_id": task.id,
+            "execution_id": execution.id,
+            "repo_clone_url": task.repository.html_url,
+            "github_token": github_token,
+            "default_branch": task.repository.default_branch,
+            "plan": plan_data,
+            "workspace_path": execution.workspace_path or str(get_workspace_path(task.id)),
+            "branch_name": execution.branch_name or f"devpilot/task-{task.id}",
+            "developer_result": None,
+            "commit_sha": execution.commit_sha,
+            "status": "QA_TESTING",         # <-- enter at QA node directly
+            "error_message": None,
+            "completed_steps": [],
+            "user_requirement": task.user_requirement,
+            "acceptance_criteria": criteria,
+            "qa_cycle": 0 if (len(execution.qa_reports) >= 3 or execution.status == "FAILED") else len(execution.qa_reports),
+            "max_qa_cycles": 3,
+            "review_cycle": 0 if (len(execution.review_reports) >= 2 or execution.status == "FAILED") else len(execution.review_reports),
+            "max_review_cycles": 2,
+            "qa_result": None,
+            "review_result": None,
+            "failure_history": [] if (len(execution.qa_reports) >= 3 or execution.status == "FAILED") else [r.failure_signature for r in execution.qa_reports if r.failure_signature],
+            "feedback_for_developer": None,
+            "qa_reports_data": [],
+            "review_reports_data": [],
+        }
+
+        # We cannot use the compiled LangGraph with a checkpoint thread that starts mid-graph,
+        # so we drive the QA→Review→Delivery sub-graph manually.
+        try:
+            state = await node_qa(qa_state)
+            route = route_qa(state)
+            if route == "FAILED_STALLED":
+                state = node_qa_stalled(state)
+            elif route == "FAILED_EXHAUSTED":
+                state = node_qa_exhausted(state)
+            elif route == "RETRY_DEVELOPER":
+                # QA failed on first explicit trigger — persist feedback and stop
+                state = node_prepare_dev_retry(state)
+                # Keep status as AWAITING_QA so the user can retry
+                state = {**state, "status": "AWAITING_QA"}
+            else:
+                # QA passed → run code review
+                state = await node_review(state)
+                route_rev = route_review(state)
+                if route_rev == "AWAITING_DELIVERY":
+                    state = node_delivery(state)
+                elif route_rev == "FAILED_BLOCKED":
+                    state = node_review_blocked(state)
+                elif route_rev == "FAILED_EXHAUSTED":
+                    state = node_review_exhausted(state)
+                else:
+                    # CHANGES_REQUESTED — execute Developer Agent to implement requested review fixes
+                    logger.info(f"[{task.id}] Review requested changes. Executing Developer Agent with review feedback...")
+                    state = node_prepare_review_retry(state)
+                    state = await node_execute(state)
+                    state = node_commit(state)
+                    state = await node_qa(state)
+                    state = await node_review(state)
+                    route_rev2 = route_review(state)
+                    if route_rev2 == "AWAITING_DELIVERY":
+                        state = node_delivery(state)
+                    elif route_rev2 == "FAILED_BLOCKED":
+                        state = node_review_blocked(state)
+                    else:
+                        state = node_review_exhausted(state)
+        except Exception as exc:
+            err_text = str(exc).strip() or exc.__class__.__name__
+            logger.exception(f"QA pipeline error for task {task.id}: {err_text}")
+            state = {
+                **qa_state,
+                "status": "FAILED",
+                "error_message": f"QA pipeline error: {err_text}",
+            }
+        finally:
+            release_execution_lock(db, task.id, lock_token)
+
+        self._persist_results(db, task, execution, state)
 
     def _persist_results(
         self,

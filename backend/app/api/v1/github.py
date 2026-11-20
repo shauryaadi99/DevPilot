@@ -136,7 +136,11 @@ def select_repository(
         if user_id and not existing.user_id:
             existing.user_id = user_id
         if session:
-            session.active_repo_id = existing.id
+            if session.active_repo_id != existing.id:
+                session.active_repo_id = existing.id
+                session.active_task_id = None
+            else:
+                session.active_repo_id = existing.id
         db.commit()
         db.refresh(existing)
         return {"status": "selected", "repository": _repo_to_dict(existing)}
@@ -158,6 +162,7 @@ def select_repository(
 
     if session:
         session.active_repo_id = repo.id
+        session.active_task_id = None
         db.commit()
 
     return {"status": "created", "repository": _repo_to_dict(repo)}

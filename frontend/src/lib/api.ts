@@ -55,6 +55,22 @@ export interface PatStatus {
   message?: string;
 }
 
+export interface TaskSummary {
+  id: string;
+  repository_id: string;
+  repository_name?: string | null;
+  user_id?: string | null;
+  title: string;
+  requirement: string;
+  status: string;
+  is_delivered: boolean;
+  pr_number?: number | null;
+  pr_url?: string | null;
+  pr_status?: string | null;
+  created_at: string;
+  updated_at?: string | null;
+}
+
 export interface SessionState {
   authenticated: boolean;
   user: UserProfile | null;
@@ -63,6 +79,8 @@ export interface SessionState {
   selected_repository: GitHubRepo | null;
   current_task: TaskDetail | null;
   execution: ExecutionStatus | null;
+  available_repositories?: GitHubRepo[];
+  available_tasks?: TaskSummary[];
   can_resume: boolean;
 }
 
@@ -160,6 +178,7 @@ export interface PlanApprovalData {
 
 export interface TaskDetail {
   id: string;
+  repository_id?: string;
   title: string;
   requirement: string;
   status: string;
@@ -174,7 +193,66 @@ export interface TaskDetail {
   implementation_plan?: ImplementationPlanData | null;
   latest_approval?: PlanApprovalData | null;
   approvals?: PlanApprovalData[];
+  delivery_approvals?: DeliveryApprovalData[];
+  pull_request?: PullRequestData | null;
+  is_delivered?: boolean;
   executions?: any[];
+}
+
+export interface DeliveryApprovalData {
+  id: string;
+  task_id: string;
+  decision: "APPROVED" | "REJECTED";
+  feedback?: string | null;
+  decided_at?: string;
+}
+
+export interface PullRequestData {
+  id: string;
+  task_id: string;
+  repository_id: string;
+  pr_number: number;
+  html_url: string;
+  title: string;
+  head_branch: string;
+  base_branch: string;
+  status: string;
+  body?: string | null;
+  created_at?: string | null;
+}
+
+export interface DeliveryStatusResponse {
+  task_id: string;
+  task_status: string;
+  is_delivered: boolean;
+  can_deliver: boolean;
+  pull_request?: PullRequestData | null;
+  approvals: DeliveryApprovalData[];
+}
+
+export interface DiffResponse {
+  task_id: string;
+  branch_name: string;
+  base_branch: string;
+  raw_diff: string;
+  file_changes: Array<{
+    change_type: string;
+    file_path: string;
+    lines_added: number;
+    lines_removed: number;
+    diff_summary?: string;
+  }>;
+  total_added: number;
+  total_removed: number;
+}
+
+export interface TimelineEvent {
+  chapter: number;
+  type: string;
+  title: string;
+  description: string;
+  timestamp?: string | null;
+  status: "COMPLETED" | "FAILED" | "IN_PROGRESS" | "PENDING";
 }
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -357,6 +435,75 @@ export async function selectRepository(repo: GitHubRepo): Promise<{ status: stri
   return res.json();
 }
 
+export async function switchRepository(repositoryId: string | null): Promise<any> {
+  const res = await fetch(`${API_BASE_URL}/api/v1/session/select-repo`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Accept": "application/json" },
+    credentials: "include",
+    body: JSON.stringify({ repository_id: repositoryId }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || "Failed to switch repository.");
+  }
+  return res.json();
+}
+
+export async function switchTask(taskId: string | null): Promise<any> {
+  const res = await fetch(`${API_BASE_URL}/api/v1/session/select-task`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Accept": "application/json" },
+    credentials: "include",
+    body: JSON.stringify({ task_id: taskId }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || "Failed to switch task.");
+  }
+  return res.json();
+}
+
+export async function startNewProject(): Promise<any> {
+  const res = await fetch(`${API_BASE_URL}/api/v1/session/new-project`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Accept": "application/json" },
+    credentials: "include",
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || "Failed to start new project.");
+  }
+  return res.json();
+}
+
+export async function startNewTask(): Promise<any> {
+  const res = await fetch(`${API_BASE_URL}/api/v1/session/new-task`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Accept": "application/json" },
+    credentials: "include",
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || "Failed to start new task.");
+  }
+  return res.json();
+}
+
+export async function listTasks(repositoryId?: string): Promise<TaskSummary[]> {
+  const url = repositoryId
+    ? `${API_BASE_URL}/api/v1/tasks?repository_id=${encodeURIComponent(repositoryId)}`
+    : `${API_BASE_URL}/api/v1/tasks`;
+  const res = await fetch(url, {
+    credentials: "include",
+    headers: { "Accept": "application/json" },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || "Failed to fetch tasks.");
+  }
+  return res.json();
+}
+
 // ── Tasks & Planning ───────────────────────────────────────────────────────
 
 export async function createTask(repoId: string, title: string, requirement: string): Promise<any> {
@@ -486,7 +633,7 @@ export interface CodeReviewReportData {
 export interface ExecutionStatus {
   execution_id: string;
   task_id: string;
-  status: "PENDING" | "CLONING" | "EXECUTING" | "COMMITTING" | "AWAITING_QA" | "AWAITING_REVIEW" | "AWAITING_DELIVERY" | "COMPLETED" | "FAILED" | "CANCELLED" | "CLOSED";
+  status: "PENDING" | "CLONING" | "EXECUTING" | "COMMITTING" | "QA_TESTING" | "REVIEWING" | "AWAITING_QA" | "AWAITING_REVIEW" | "AWAITING_DELIVERY" | "COMPLETED" | "FAILED" | "CANCELLED" | "CLOSED";
   branch_name: string | null;
   current_step: number;
   total_steps: number;
@@ -596,6 +743,22 @@ export async function closeTask(
   return res.json();
 }
 
+export async function reopenTask(
+  taskId: string,
+): Promise<{ status: string; task_id: string; task_status: string; message: string }> {
+  const url = `${API_BASE_URL}/api/v1/tasks/${taskId}/reopen`;
+  const res = await fetch(url, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Accept": "application/json" },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Reopen task failed: ${res.status}`);
+  }
+  return res.json();
+}
+
 
 export async function getQaReports(
   taskId: string
@@ -625,6 +788,101 @@ export async function getReviewReports(
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error(err.detail || `Failed to fetch Code Review reports: ${res.status}`);
+  }
+  return res.json();
+}
+
+// ── Chapter 5: Delivery & Pull Request ─────────────────────────────────────
+
+export interface FinalApprovalResponseData {
+  id: string;
+  task_id: string;
+  decision: "APPROVED" | "REJECTED";
+  feedback?: string | null;
+  decided_at: string;
+  task_status: string;
+  approval?: DeliveryApprovalData;
+}
+
+export async function submitFinalApproval(
+  taskId: string,
+  decisionOrPayload: "APPROVED" | "REJECTED" | { decision: "APPROVED" | "REJECTED"; feedback?: string },
+  feedback?: string
+): Promise<FinalApprovalResponseData> {
+  const url = `${API_BASE_URL}/api/v1/tasks/${taskId}/final-approval`;
+  const body =
+    typeof decisionOrPayload === "object"
+      ? decisionOrPayload
+      : { decision: decisionOrPayload, feedback };
+  const res = await fetch(url, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Final approval failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function deliverTask(
+  taskId: string
+): Promise<{ status: string; message: string; pull_request: PullRequestData }> {
+  const url = `${API_BASE_URL}/api/v1/tasks/${taskId}/deliver`;
+  const res = await fetch(url, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Accept": "application/json" },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Delivery failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function getDeliveryStatus(taskId: string): Promise<DeliveryStatusResponse> {
+  const url = `${API_BASE_URL}/api/v1/tasks/${taskId}/delivery`;
+  const res = await fetch(url, {
+    cache: "no-store",
+    credentials: "include",
+    headers: { "Accept": "application/json" },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Failed to fetch delivery status: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function getTaskDiff(taskId: string): Promise<DiffResponse> {
+  const url = `${API_BASE_URL}/api/v1/tasks/${taskId}/diff`;
+  const res = await fetch(url, {
+    cache: "no-store",
+    credentials: "include",
+    headers: { "Accept": "application/json" },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Failed to fetch task diff: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function getTaskTimeline(
+  taskId: string
+): Promise<{ task_id: string; timeline: TimelineEvent[] }> {
+  const url = `${API_BASE_URL}/api/v1/tasks/${taskId}/timeline`;
+  const res = await fetch(url, {
+    cache: "no-store",
+    credentials: "include",
+    headers: { "Accept": "application/json" },
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Failed to fetch task timeline: ${res.status}`);
   }
   return res.json();
 }

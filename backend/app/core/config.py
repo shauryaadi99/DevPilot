@@ -50,6 +50,7 @@ class Settings(BaseSettings):
 
     # Groq LLM settings
     GROQ_API_KEY: str | None = None
+    GROQ_API_FALLBACK_KEY: str | None = None
     GROQ_MODEL: str = "openai/gpt-oss-120b"
     GROQ_TIMEOUT_SECONDS: float = 45.0
 

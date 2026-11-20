@@ -41,7 +41,7 @@ class User(Base):
     __tablename__ = "users"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    github_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False, index=True)
+    github_id: Mapped[Optional[int]] = mapped_column(BigInteger, unique=True, nullable=True, index=True)
     username: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
@@ -149,6 +149,8 @@ class Task(Base):
     lock: Mapped[Optional["ExecutionLock"]] = relationship("ExecutionLock", back_populates="task", uselist=False, cascade="all, delete-orphan")
     qa_reports: Mapped[List["QAReport"]] = relationship("QAReport", back_populates="task", cascade="all, delete-orphan", order_by="QAReport.created_at")
     review_reports: Mapped[List["CodeReviewReport"]] = relationship("CodeReviewReport", back_populates="task", cascade="all, delete-orphan", order_by="CodeReviewReport.created_at")
+    delivery_approvals: Mapped[List["DeliveryApproval"]] = relationship("DeliveryApproval", back_populates="task", cascade="all, delete-orphan", order_by="DeliveryApproval.decided_at")
+    pull_request: Mapped[Optional["PullRequestRecord"]] = relationship("PullRequestRecord", back_populates="task", uselist=False, cascade="all, delete-orphan")
 
 
 # ── Group C: Planning & Review ──────────────────────────────────────────────
@@ -371,4 +373,46 @@ class CodeReviewReport(Base):
     # Relationships
     task: Mapped["Task"] = relationship("Task", back_populates="review_reports")
     execution: Mapped["TaskExecution"] = relationship("TaskExecution", back_populates="review_reports")
+
+
+# ── Group F: GitHub Delivery & Pull Request ────────────────────────────────
+
+
+class DeliveryApproval(Base):
+    """Persistent record of human Approval 2 (Final Delivery & PR Creation)."""
+
+    __tablename__ = "delivery_approvals"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    task_id: Mapped[str] = mapped_column(String(36), ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    decision: Mapped[str] = mapped_column(String(50), nullable=False)  # APPROVED, REJECTED
+    feedback: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    # Relationships
+    task: Mapped["Task"] = relationship("Task", back_populates="delivery_approvals")
+    user: Mapped[Optional["User"]] = relationship("User")
+
+
+class PullRequestRecord(Base):
+    """Persistent record of a successfully delivered GitHub Pull Request."""
+
+    __tablename__ = "pull_requests"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    task_id: Mapped[str] = mapped_column(String(36), ForeignKey("tasks.id", ondelete="CASCADE"), unique=True, nullable=False)
+    repository_id: Mapped[str] = mapped_column(String(36), ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False, index=True)
+    pr_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    html_url: Mapped[str] = mapped_column(String(500), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    head_branch: Mapped[str] = mapped_column(String(100), nullable=False)
+    base_branch: Mapped[str] = mapped_column(String(100), default="main")
+    status: Mapped[str] = mapped_column(String(50), default="OPEN")  # OPEN, MERGED, CLOSED
+    body: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    # Relationships
+    task: Mapped["Task"] = relationship("Task", back_populates="pull_request")
+    repository: Mapped["Repository"] = relationship("Repository")
 

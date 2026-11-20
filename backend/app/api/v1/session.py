@@ -4,8 +4,9 @@ Provides complete state restoration for browser refresh, independent of whether
 an execution is currently running.
 """
 
-from typing import Any, Dict, Optional
-from fastapi import APIRouter, Depends, Request
+from typing import Any, Dict, List, Optional
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.api.v1.auth import get_optional_current_user
@@ -20,6 +21,8 @@ from app.db.models import (
     ImplementationPlan,
     PlanApproval,
     TaskExecution,
+    QAReport,
+    CodeReviewReport,
 )
 
 router = APIRouter(prefix="/api/v1/session", tags=["Session & State Rehydration"])
@@ -65,27 +68,58 @@ async def get_session_state(
     repo: Optional[Repository] = None
     if session.active_repo_id:
         repo = db.query(Repository).filter(Repository.id == session.active_repo_id).first()
-    if not repo:
-        repo = (
-            db.query(Repository)
-            .filter((Repository.user_id == user.id) | (Repository.user_id.is_(None)))
-            .order_by(Repository.updated_at.desc())
-            .first()
-        )
 
-    # Resolve active task
+    # Resolve active task strictly scoped to active repository
     task: Optional[Task] = None
-    if session.active_task_id:
-        task = db.query(Task).filter(Task.id == session.active_task_id).first()
-    if not task and repo:
-        task = (
+    if repo:
+        if session.active_task_id:
+            task = db.query(Task).filter(Task.id == session.active_task_id).first()
+            if task and task.repository_id != repo.id:
+                # Prevent cross-repository task pollution
+                task = None
+                session.active_task_id = None
+                db.commit()
+
+    # Available repositories for switcher
+    repo_query = db.query(Repository)
+    if user:
+        repo_query = repo_query.filter((Repository.user_id == user.id) | (Repository.user_id.is_(None)))
+    user_repos = repo_query.order_by(Repository.updated_at.desc()).all()
+    available_repositories = [
+        {
+            "id": r.id,
+            "name": r.name,
+            "full_name": r.full_name,
+            "owner": r.owner,
+            "default_branch": r.default_branch,
+            "html_url": r.html_url,
+            "description": r.description,
+        }
+        for r in user_repos
+    ]
+
+    # Available tasks for the selected repository
+    available_tasks = []
+    if repo:
+        tasks_query = (
             db.query(Task)
             .filter(Task.repository_id == repo.id)
             .order_by(Task.created_at.desc())
-            .first()
+            .all()
         )
-    if not task:
-        task = db.query(Task).order_by(Task.created_at.desc()).first()
+        available_tasks = [
+            {
+                "id": t.id,
+                "title": t.title,
+                "requirement": t.user_requirement,
+                "status": t.status,
+                "is_delivered": t.pull_request is not None,
+                "pr_number": t.pull_request.pr_number if t.pull_request else None,
+                "pr_url": t.pull_request.html_url if t.pull_request else None,
+                "created_at": t.created_at.isoformat() if t.created_at else None,
+            }
+            for t in tasks_query
+        ]
 
     # Build task detail payload
     task_detail: Optional[Dict[str, Any]] = None
@@ -141,6 +175,41 @@ async def get_session_state(
                         "timestamp": log.timestamp.isoformat(),
                     }
                     for log in execution.logs
+                ],
+                "qa_reports": [
+                    {
+                        "id": qr.id,
+                        "cycle_number": qr.cycle_number,
+                        "overall_passed": qr.overall_passed,
+                        "commands_executed": qr.commands_executed,
+                        "tests_passed": qr.tests_passed,
+                        "tests_failed": qr.tests_failed,
+                        "tests_skipped": qr.tests_skipped,
+                        "exit_codes": qr.exit_codes,
+                        "logs": qr.logs,
+                        "failure_summary": qr.failure_summary,
+                        "failure_signature": qr.failure_signature,
+                        "test_details": qr.test_details,
+                        "acceptance_criteria_results": qr.acceptance_criteria_results,
+                        "actionable_feedback": qr.actionable_feedback,
+                        "created_at": qr.created_at.isoformat() if qr.created_at else None,
+                    }
+                    for qr in execution.qa_reports
+                ],
+                "review_reports": [
+                    {
+                        "id": rr.id,
+                        "cycle_number": rr.cycle_number,
+                        "outcome": rr.outcome,
+                        "summary": rr.summary,
+                        "correctness_assessment": rr.correctness_assessment,
+                        "security_assessment": rr.security_assessment,
+                        "quality_score": rr.quality_score,
+                        "issues": rr.issues,
+                        "approval_recommendation": rr.approval_recommendation,
+                        "created_at": rr.created_at.isoformat() if rr.created_at else None,
+                    }
+                    for rr in execution.review_reports
                 ],
             }
 
@@ -215,6 +284,26 @@ async def get_session_state(
                 }
                 for a in task.approvals
             ],
+            "delivery_approvals": [
+                {
+                    "id": da.id,
+                    "decision": da.decision,
+                    "feedback": da.feedback,
+                    "decided_at": da.decided_at.isoformat() if da.decided_at else None,
+                }
+                for da in (task.delivery_approvals or [])
+            ],
+            "pull_request": {
+                "id": task.pull_request.id,
+                "pr_number": task.pull_request.pr_number,
+                "html_url": task.pull_request.html_url,
+                "title": task.pull_request.title,
+                "head_branch": task.pull_request.head_branch,
+                "base_branch": task.pull_request.base_branch,
+                "status": task.pull_request.status,
+                "created_at": task.pull_request.created_at.isoformat() if task.pull_request.created_at else None,
+            } if task.pull_request else None,
+            "is_delivered": task.pull_request is not None,
             "executions": [
                 {
                     "id": e.id,
@@ -252,6 +341,106 @@ async def get_session_state(
         } if repo else None,
         "current_task": task_detail,
         "execution": execution_detail,
+        "available_repositories": available_repositories,
+        "available_tasks": available_tasks,
         "can_resume": can_resume,
     }
+
+
+class SelectRepoSessionRequest(BaseModel):
+    repository_id: Optional[str] = None
+
+
+class SelectTaskSessionRequest(BaseModel):
+    task_id: Optional[str] = None
+
+
+@router.post("/select-repo", summary="Switch Active Repository / Project")
+async def select_session_repo(
+    payload: SelectRepoSessionRequest,
+    auth_context: Optional[tuple] = Depends(get_optional_current_user),
+    db: Session = Depends(get_db),
+):
+    """Switch active project repository and select its latest task or reset task context."""
+    if not auth_context:
+        return {"status": "unauthenticated"}
+    user, session, _ = auth_context
+
+    if payload.repository_id:
+        repo = db.query(Repository).filter(Repository.id == payload.repository_id).first()
+        if not repo:
+            raise HTTPException(status_code=404, detail="Repository not found.")
+        session.active_repo_id = repo.id
+        latest_task = (
+            db.query(Task)
+            .filter(Task.repository_id == repo.id)
+            .order_by(Task.created_at.desc())
+            .first()
+        )
+        session.active_task_id = latest_task.id if latest_task else None
+    else:
+        # Starting new project / clear repository selection
+        session.active_repo_id = None
+        session.active_task_id = None
+
+    db.commit()
+    return {
+        "status": "ok",
+        "active_repo_id": session.active_repo_id,
+        "active_task_id": session.active_task_id,
+    }
+
+
+@router.post("/select-task", summary="Switch Active Task or Prepare New Task")
+async def select_session_task(
+    payload: SelectTaskSessionRequest,
+    auth_context: Optional[tuple] = Depends(get_optional_current_user),
+    db: Session = Depends(get_db),
+):
+    """Switch to a specific task or prepare an empty slate for a new task."""
+    if not auth_context:
+        return {"status": "unauthenticated"}
+    user, session, _ = auth_context
+
+    if payload.task_id:
+        task = db.query(Task).filter(Task.id == payload.task_id).first()
+        if not task:
+            raise HTTPException(status_code=404, detail="Task not found.")
+        session.active_task_id = task.id
+        session.active_repo_id = task.repository_id
+    else:
+        # Clear active task for new task creation within active repo
+        session.active_task_id = None
+
+    db.commit()
+    return {"status": "ok", "active_task_id": session.active_task_id}
+
+
+@router.post("/new-project", summary="Reset Session for New Project Formulation")
+async def start_new_project(
+    auth_context: Optional[tuple] = Depends(get_optional_current_user),
+    db: Session = Depends(get_db),
+):
+    """Reset both active repository and active task for a clean new project."""
+    if not auth_context:
+        return {"status": "unauthenticated"}
+    user, session, _ = auth_context
+    session.active_repo_id = None
+    session.active_task_id = None
+    db.commit()
+    return {"status": "ok", "message": "Ready for new project repository"}
+
+
+@router.post("/new-task", summary="Reset Session for New Task in Current Repository")
+async def start_new_task(
+    auth_context: Optional[tuple] = Depends(get_optional_current_user),
+    db: Session = Depends(get_db),
+):
+    """Reset active task while maintaining active repository for new task formulation."""
+    if not auth_context:
+        return {"status": "unauthenticated"}
+    user, session, _ = auth_context
+    session.active_task_id = None
+    db.commit()
+    return {"status": "ok", "message": "Ready for new task in repository"}
 

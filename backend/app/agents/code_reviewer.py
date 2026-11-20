@@ -26,8 +26,14 @@ Your responsibility:
    - Quality & Maintainability: Code style, redundant code, modularity, readability.
 3. Determine one of three review outcomes:
    - APPROVED: Code is safe, correct, and ready for delivery/PR.
-   - CHANGES_REQUESTED: Actionable improvements or non-critical bugs found; Developer should fix.
-   - BLOCKED: Critical security vulnerability, data loss risk, or severe architectural violation.
+   - CHANGES_REQUESTED: Critical logic bugs or broken functionality found that Developer must fix.
+   - BLOCKED: Severe security vulnerability, data loss risk, or malicious code.
+
+CRITICAL RULES:
+- When automated QA tests have passed and acceptance criteria are satisfied, default to outcome: "APPROVED" (quality_score >= 8) unless there is an exploitable security vulnerability or broken logic.
+- NEVER request or suggest adding new uninstalled third-party packages or external services (e.g., Redis, nodemailer, sendgrid, express-rate-limit). In-memory Maps, built-in Node.js crypto/events, or console logging are completely appropriate for this environment and MUST NOT be rejected.
+- Only issue CHANGES_REQUESTED if there is an actual runtime bug or broken contract in application code. Do not block delivery for minor architectural preferences or production-scaling suggestions.
+- IMPORTANT: When a diff preview contains a notice like "[Diff preview truncated...]", the file on disk is complete. NEVER report preview truncation as a bug, typo, or missing code.
 
 Token Efficiency & Strict JSON Schema Rules:
 - Output MUST be valid JSON only. No markdown fences outside the JSON.
@@ -82,11 +88,16 @@ class CodeReviewerAgent:
                 approval_recommendation="Ready for delivery.",
             )
 
-        # Truncate very large diffs to avoid LLM context exhaustion
-        max_diff_len = 8000
-        truncated_diff = diff_text[:max_diff_len]
+        # Truncate very large diffs cleanly at newline boundaries to avoid LLM context exhaustion
+        max_diff_len = 24000
         if len(diff_text) > max_diff_len:
-            truncated_diff += f"\n... [Diff truncated: total {len(diff_text)} characters]"
+            cutoff = diff_text[:max_diff_len].rfind("\n")
+            if cutoff > 0:
+                truncated_diff = diff_text[:cutoff] + f"\n\n[Diff preview truncated: {len(diff_text) - cutoff} additional characters omitted from preview. Note: The codebase on disk is complete; do not treat preview truncation as missing code.]"
+            else:
+                truncated_diff = diff_text[:max_diff_len] + "\n\n[Diff preview truncated. Note: The codebase on disk is complete.]"
+        else:
+            truncated_diff = diff_text
 
         prompt = (
             f"TASK REQUIREMENT:\n{task_requirement}\n\n"

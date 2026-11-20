@@ -19,13 +19,13 @@ export interface ChapterStatusInfo {
   status: "COMPLETED" | "IN_PROGRESS" | "PENDING" | "FAILED";
   percent: number;
   detail: string;
-  tab?: "diagnostics" | "planning" | "execution" | "qa";
+  tab?: "diagnostics" | "planning" | "execution" | "qa" | "delivery" | "all";
 }
 
 interface ChapterProgressBarProps {
   chapters: ChapterStatusInfo[];
   activeTab?: string;
-  onTabChange?: (tab: "diagnostics" | "planning" | "execution" | "qa") => void;
+  onTabChange?: (tab: "diagnostics" | "planning" | "execution" | "qa" | "delivery" | "all") => void;
 }
 
 export const ChapterProgressBar: React.FC<ChapterProgressBarProps> = ({

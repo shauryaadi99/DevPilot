@@ -24,13 +24,33 @@ from app.core.logging import logger
 
 def get_workspace_root() -> Path:
     """Return absolute persistent workspace root from settings."""
-    root = Path(get_settings().WORKSPACE_ROOT).resolve()
+    configured = Path(get_settings().WORKSPACE_ROOT)
+    if configured.is_absolute():
+        root = configured.resolve()
+    else:
+        cwd = Path.cwd()
+        if (cwd / configured).exists():
+            root = (cwd / configured).resolve()
+        elif (cwd / "backend" / configured).exists():
+            root = (cwd / "backend" / configured).resolve()
+        else:
+            root = (cwd / configured).resolve()
     root.mkdir(parents=True, exist_ok=True)
     return root
 
 
 def _workspace_path(task_id: str) -> Path:
-    return get_workspace_root() / task_id
+    primary = get_workspace_root() / task_id
+    if primary.exists():
+        return primary
+    for candidate in [
+        Path.cwd() / "backend" / "workspaces" / task_id,
+        Path.cwd() / "workspaces" / task_id,
+        Path(__file__).resolve().parent.parent.parent / "workspaces" / task_id,
+    ]:
+        if candidate.exists():
+            return candidate.resolve()
+    return primary
 
 
 # ── Read-only helpers ───────────────────────────────────────────────────────
@@ -69,6 +89,38 @@ def get_diff(workspace_path: Path, base_branch: str = "main") -> str:
             return ""
     except Exception:
         return ""
+
+
+def get_diff_stats(workspace_path: Path, base_branch: str = "main") -> List[Dict[str, Any]]:
+    """Return file-by-file added/removed stats from git diff --numstat."""
+    try:
+        repo = Repo(str(workspace_path), search_parent_directories=True)
+        raw = ""
+        for ref in [f"origin/{base_branch}...HEAD", f"{base_branch}...HEAD", "HEAD~1"]:
+            try:
+                res = repo.git.diff("--numstat", ref)
+                if res.strip():
+                    raw = res.strip()
+                    break
+            except Exception:
+                continue
+
+        stats: List[Dict[str, Any]] = []
+        for line in raw.splitlines():
+            parts = line.strip().split("\t")
+            if len(parts) >= 3:
+                added, removed, path = parts[0], parts[1], parts[2]
+                a_count = int(added) if added.isdigit() else 0
+                r_count = int(removed) if removed.isdigit() else 0
+                stats.append({
+                    "file_path": path,
+                    "lines_added": a_count,
+                    "lines_removed": r_count,
+                    "change_type": "CREATE" if r_count == 0 and a_count > 0 else "MODIFY",
+                })
+        return stats
+    except Exception:
+        return []
 
 
 # ── Idempotent workspace preparation ───────────────────────────────────────
@@ -219,6 +271,54 @@ def cleanup_workspace(task_id: str) -> None:
         f"[{task_id}] cleanup_workspace() called but is now a no-op. "
         "Workspaces are preserved until explicit task closure."
     )
+
+
+# ── Chapter 5: Remote Push ───────────────────────────────────────────────────
+
+def push_task_branch(
+    workspace_path: Path,
+    branch_name: str,
+    clone_url: str,
+    github_token: str,
+    force: bool = False,
+) -> None:
+    """Push local task branch to the remote origin using authenticated URL.
+
+    Safety:
+    - Never pushes to 'main' or 'master' branch.
+    - Strips token before logging.
+
+    Raises:
+        ValueError: if branch_name is main or master.
+        RuntimeError: on Git push failure.
+    """
+    normalized_branch = branch_name.lower().strip()
+    if normalized_branch in ("main", "master"):
+        raise ValueError(f"Pushing directly to protected branch '{branch_name}' is strictly forbidden.")
+
+    repo = Repo(str(workspace_path))
+    authenticated_url = _inject_token(clone_url, github_token)
+
+    # Configure or update authenticated remote
+    try:
+        remote = repo.remote("origin")
+        remote.set_url(authenticated_url)
+    except (ValueError, IndexError):
+        remote = repo.create_remote("origin", authenticated_url)
+
+    logger.info(f"Pushing branch {branch_name} to remote repository...")
+    try:
+        push_info = remote.push(refspec=f"{branch_name}:{branch_name}", force=force)
+        for info in push_info:
+            if info.flags & info.ERROR:
+                err_summary = info.summary or "Unknown Git remote push error"
+                raise RuntimeError(f"Git remote rejected branch push: {err_summary}")
+        logger.info(f"Branch {branch_name} successfully pushed to remote.")
+    except GitCommandError as exc:
+        clean_msg = str(exc)
+        if github_token:
+            clean_msg = clean_msg.replace(github_token, "ghp_••••")
+        raise RuntimeError(f"Git push failed: {clean_msg}") from exc
 
 
 # ── Internal utilities ───────────────────────────────────────────────────────

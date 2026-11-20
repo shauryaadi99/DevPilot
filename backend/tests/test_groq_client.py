@@ -73,3 +73,35 @@ def test_groq_timeout_handling():
         assert result["configured"] is True
         assert "5.0" in result["message"]
 
+
+def test_groq_fallback_key_on_failure():
+    """Verify that when the primary key fails with RateLimitError, the fallback key is used."""
+    from groq import RateLimitError
+    provider = GroqProvider()
+    provider.get_available_keys = lambda: ["gsk_primary_key_rate_limited", "gsk_fallback_key_working"]
+
+    primary_raw_client = MagicMock()
+    primary_raw_client.chat.completions.create.side_effect = RateLimitError(
+        "Rate limit reached", response=MagicMock(status_code=429), body={}
+    )
+
+    fallback_raw_client = MagicMock()
+    fallback_response = MagicMock()
+    fallback_response.choices = [MagicMock(message=MagicMock(content="Fallback response"))]
+    fallback_raw_client.chat.completions.create.return_value = fallback_response
+
+    def mock_get_raw(key):
+        if key == "gsk_primary_key_rate_limited":
+            return primary_raw_client
+        return fallback_raw_client
+
+    with patch.object(provider, "_get_raw_client", side_effect=mock_get_raw):
+        client = provider._get_client()
+        res = client.chat.completions.create(
+            model="openai/gpt-oss-120b",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+        assert res.choices[0].message.content == "Fallback response"
+        assert primary_raw_client.chat.completions.create.called
+        assert fallback_raw_client.chat.completions.create.called
+

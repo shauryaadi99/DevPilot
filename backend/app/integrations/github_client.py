@@ -203,3 +203,132 @@ class GitHubClient:
                 return None
         return None
 
+    async def create_pull_request(
+        self,
+        owner: str,
+        repo: str,
+        title: str,
+        body: str,
+        head: str,
+        base: str = "main",
+        draft: bool = False,
+    ) -> Dict[str, Any]:
+        """Create a pull request on GitHub."""
+        if not self.token:
+            raise GitHubError("GitHub token required to create a pull request.", status_code=401)
+
+        url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/pulls"
+        payload = {
+            "title": title,
+            "body": body,
+            "head": head,
+            "base": base,
+            "draft": draft,
+        }
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            try:
+                res = await client.post(url, headers=self._get_headers(), json=payload)
+            except Exception as e:
+                logger.error(f"GitHub API connection error creating PR: {e}")
+                raise GitHubError("Failed to reach GitHub API for pull request creation.", status_code=503)
+
+        if res.status_code == 422:
+            data = res.json()
+            error_msg = data.get("message", "")
+            errors = data.get("errors", [])
+            detail = " ".join([e.get("message", "") for e in errors]) or error_msg
+            raise GitHubError(f"GitHub rejected pull request: {detail}", status_code=422)
+        if res.status_code == 401:
+            raise GitHubError("Unauthorized: GitHub token lacks permissions or is expired.", status_code=401)
+        if res.status_code == 403:
+            raise GitHubError("Forbidden: insufficient permissions to create pull request on repository.", status_code=403)
+        if res.status_code not in (200, 201):
+            raise GitHubError(f"Failed to create pull request: HTTP {res.status_code}", status_code=res.status_code)
+
+        data = res.json()
+        return {
+            "pr_number": data.get("number"),
+            "html_url": data.get("html_url"),
+            "title": data.get("title"),
+            "state": data.get("state", "open").upper(),
+            "head_branch": data.get("head", {}).get("ref", head),
+            "base_branch": data.get("base", {}).get("ref", base),
+            "created_at": data.get("created_at"),
+        }
+
+    async def update_pull_request(
+        self,
+        owner: str,
+        repo: str,
+        pull_number: int,
+        title: Optional[str] = None,
+        body: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Update pull request title or body on GitHub."""
+        if not self.token:
+            raise GitHubError("GitHub token required to update a pull request.", status_code=401)
+
+        url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/pulls/{pull_number}"
+        payload: Dict[str, Any] = {}
+        if title is not None:
+            payload["title"] = title
+        if body is not None:
+            payload["body"] = body
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            try:
+                res = await client.patch(url, headers=self._get_headers(), json=payload)
+            except Exception as e:
+                logger.error(f"GitHub API connection error updating PR: {e}")
+                raise GitHubError("Failed to reach GitHub API for pull request update.", status_code=503)
+
+        if res.status_code not in (200, 201):
+            raise GitHubError(f"Failed to update pull request: HTTP {res.status_code}", status_code=res.status_code)
+
+        data = res.json()
+        return {
+            "pr_number": data.get("number"),
+            "html_url": data.get("html_url"),
+            "title": data.get("title"),
+            "body": data.get("body"),
+            "state": data.get("state", "open").upper(),
+        }
+
+    async def find_existing_pull_request(
+        self,
+        owner: str,
+        repo: str,
+        head: str,
+        base: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Check if an open pull request already exists for the given head branch."""
+        if not self.token:
+            return None
+
+        url = f"{GITHUB_API_BASE}/repos/{owner}/{repo}/pulls"
+        head_param = f"{owner}:{head}" if ":" not in head else head
+        params: Dict[str, Any] = {"state": "open", "head": head_param}
+        if base:
+            params["base"] = base
+
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            try:
+                res = await client.get(url, headers=self._get_headers(), params=params)
+                if res.status_code == 200:
+                    prs = res.json()
+                    if prs and len(prs) > 0:
+                        pr = prs[0]
+                        return {
+                            "pr_number": pr.get("number"),
+                            "html_url": pr.get("html_url"),
+                            "title": pr.get("title"),
+                            "state": pr.get("state", "open").upper(),
+                            "head_branch": pr.get("head", {}).get("ref", head),
+                            "base_branch": pr.get("base", {}).get("ref", base or "main"),
+                            "created_at": pr.get("created_at"),
+                        }
+            except Exception as e:
+                logger.warning(f"Error checking existing PR for {owner}/{repo}: {e}")
+        return None
+

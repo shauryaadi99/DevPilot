@@ -201,13 +201,10 @@ async def github_callback(code: str, response: Response, db: Session = Depends(g
 @router.post("/dev-login", summary="Development Login (No OAuth App Required)")
 def dev_login(payload: DevLoginRequest, response: Response, db: Session = Depends(get_db)):
     """Local development login bypassing OAuth app setup when testing locally."""
-    # Deterministic mock github_id from username
-    mock_github_id = abs(hash(payload.username)) % (10**9)
-
-    user = db.query(User).filter(User.username == payload.username).first()
+    user = db.query(User).filter(User.username == payload.username.strip()).first()
     if not user:
         user = User(
-            github_id=mock_github_id,
+            github_id=None,
             username=payload.username.strip(),
             name=payload.name or payload.username,
             email=payload.email or f"{payload.username}@users.noreply.github.com",

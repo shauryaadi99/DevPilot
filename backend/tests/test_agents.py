@@ -82,3 +82,39 @@ async def test_architect_mock_execution():
         plan = await agent.plan(analysis, {"confirmed_facts": ["Fact 1"]})
         assert plan.summary == "Plan summary"
         assert len(plan.files_to_create) == 1
+
+
+@pytest.mark.asyncio
+async def test_developer_agent_handles_list_output(tmp_path):
+    """Verify DeveloperAgent handles LLM returning a JSON array/list of file objects without AttributeError."""
+    import json
+    from pathlib import Path
+    from app.agents.developer import DeveloperAgent
+    from app.agents.schemas import ImplementationStep
+
+    agent = DeveloperAgent()
+    agent.groq_provider.api_key = "gsk_mock_valid_key_123"
+
+    mock_choice = MagicMock()
+    # LLM returns a JSON list of files instead of a single object
+    mock_choice.message.content = json.dumps([
+        {"file_path": "frontend/src/comp.jsx", "content": "// component code", "explanation": "Create component"},
+        {"file_path": "frontend/src/app.jsx", "content": "// app code", "explanation": "Update app"}
+    ])
+    mock_wrapper = MagicMock()
+    mock_wrapper.chat.completions.create.return_value = MagicMock(choices=[mock_choice])
+
+    plan = ArchitectPlanOutput(
+        summary="Test plan",
+        implementation_steps=[
+            ImplementationStep(step_number=1, title="Frontend UI", description="Build UI", affected_files=["frontend/src/comp.jsx"])
+        ],
+    )
+
+    with patch.object(agent.groq_provider, "_get_client", return_value=mock_wrapper):
+        result = await agent.implement(plan=plan, workspace_path=Path(tmp_path))
+        assert result.success is True
+        assert (tmp_path / "frontend" / "src" / "comp.jsx").exists()
+        assert (tmp_path / "frontend" / "src" / "app.jsx").exists()
+        assert (tmp_path / "frontend" / "src" / "comp.jsx").read_text(encoding="utf-8") == "// component code"
+        assert (tmp_path / "frontend" / "src" / "app.jsx").read_text(encoding="utf-8") == "// app code"
